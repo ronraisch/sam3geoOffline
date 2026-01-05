@@ -1,4 +1,5 @@
 *.pth
+*.safetensors
 .cache/*
 .conda/*
 /home/ronraisch/.cache/*
