@@ -8,11 +8,11 @@ from PIL import Image
 # Use the standard import; leafmap will handle the backend
 import leafmap
 from ipyleaflet import ImageOverlay, LayersControl
+from src.utils import MAP_BOUNDS
 
 # Types and Constants
 MAX_DIMENSION: int = 2000
 path_or_str = Union[Path, str]
-MAP_BOUNDS = Tuple[Tuple[float, float], Tuple[float, float]]
 
 
 def resize_if_too_large(img: Image.Image, max_dimension: int) -> Image.Image:
@@ -93,14 +93,14 @@ def create_offline_leafmap(
 
 
 if __name__ == "__main__":
-    map_bounds = (
-        (31.550854962060072, 34.46861743927003),
-        (31.572795239267688, 34.51196193695069),
-    )
-    overlay_bounds = (
-        (31.559083170805593, 34.484871625900276),
-        (31.564568240127038, 34.49570775032044),
-    )
+    map_bounds = [
+        [31.550854962060072, 34.46861743927003],
+        [31.572795239267688, 34.51196193695069],
+    ]
+    overlay_bounds = [
+        [31.559083170805593, 34.484871625900276],
+        [31.564568240127038, 34.49570775032044],
+    ]
 
     base_map_path = Path("data/map.png")
     overlay_image_path = Path("data/overlay.png")

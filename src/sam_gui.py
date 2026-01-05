@@ -1,698 +1,385 @@
 import logging
-import os
-from typing import Union
-import geopandas as gpd
-from typing import Any, Optional
-from PIL import Image
 import io
 import base64
-import ipyleaflet
-import leafmap
-from matplotlib import pyplot as plt
-import numpy as np
-import pyproj
-import rasterio
-from samgeo import SamGeo3
-from rasterio import features
-import shapely
-from ipyleaflet import ImageOverlay
+import tempfile
+import sys
+import traceback
+from pathlib import Path
+from typing import Tuple, Union, Any, Optional, List, Dict, Final
 
-from .create_overlay_map import MAP_BOUNDS
+import numpy as np
+import rasterio
+import shapely
+import geopandas as gpd
+from PIL import Image
+from rasterio import features
+import matplotlib.pyplot as plt
+from shapely.geometry import shape
+
+import ipyleaflet
+import ipywidgets as widgets
+import leafmap
+import leafmap.colormaps as cm
+from samgeo import SamGeo3
+from IPython.display import display
+
+# Custom modularized imports
+from src.utils import MAP_BOUNDS, generate_id, write_logs
+from buildingregulariser import regularize_geodataframe
+
+
+# --- Configuration & Constants ---
+
+
+class Config:
+    DEFAULT_OPACITY: Final[float] = 0.7
+    DEFAULT_BOX_THRESH: Final[float] = 0.25
+    DEFAULT_TEXT_THRESH: Final[float] = 0.25
+    NODATA_VAL: Final[int] = 0
+    ALPHA_FULL: Final[int] = 255
+
+    WIDGET_WIDTH: Final[str] = "100%"
+    INPUT_WIDTH: Final[str] = "350px"
+    BTN_WIDTH: Final[str] = "120px"
+    ICON_SIZE: Final[str] = "28px"
+    CURSOR_STYLE: Final[str] = "crosshair"
+
+    TIF_EXT: Final[str] = ".tif"
+    GPKG_EXT: Final[str] = ".gpkg"
+    RECT_SUFFIX: Final[str] = "_rect"
+    PALLETE_DEFAULT: Final[str] = "viridis"
+
+
+# --- Helper Classes ---
 
 
 class MapWrapper(leafmap.Map):
-    """A wrapper around MapWrapper to add custom functionality if needed."""
-
-    def __init__(
-        self,
-        m: leafmap.Map,
-        layer_name: Optional[str] = None,
-        toolbar: Optional[ipyleaflet.WidgetControl] = None,
-        save_control: Optional[ipyleaflet.WidgetControl] = None,
-        **kwargs,
-    ):
+    def __init__(self, m: leafmap.Map, **kwargs: Any):
         super().__init__(**kwargs)
         self.__dict__.update(m.__dict__)
-        if layer_name is not None:
-            self.layer_name = layer_name
-        else:
-            self.layer_name = ""
-        self.toolbar_control = toolbar
-        self.save_control = save_control
+        self.layer_name: str = ""
 
 
-def add_offline_raster(
-    m: MapWrapper,
-    tif_path: str,
-    bounds: MAP_BOUNDS,
-    palette: str = "viridis",
-    nodata: int = 0,
-    opacity: float = 1.0,
-):
-    """
-    Applies a palette and nodata transparency to a TIF,
-    then adds it to the map as an offline-safe ImageOverlay.
-    """
-    # 1. Open image with PIL
+# --- Core GIS Logic ---
+
+
+def get_rgba_uri(tif_path: Path, palette: str, opacity: float) -> str:
     with Image.open(tif_path) as img:
-        # Convert to numpy array for processing
         data = np.array(img).astype(float)
 
-    # 2. Handle Nodata: Create a mask where data is NOT the nodata value
-    # This will be used for the Alpha channel
-    alpha_mask = np.where(data == nodata, 0, 255).astype(np.uint8)
-
-    # 3. Apply Palette (Color Mapping)
-    # Normalize data to 0-1 for matplotlib colormaps
-    valid_mask = data != nodata
-    if valid_mask.any():
-        data_min, data_max = data[valid_mask].min(), data[valid_mask].max()
-        # Avoid division by zero
-        if data_max != data_min:
-            normalized_data = (data - data_min) / (data_max - data_min)
-        else:
-            normalized_data = data * 0
-    else:
-        normalized_data = data
-
-    # Get the colormap from matplotlib
-    cmap = plt.get_cmap(palette)
-    # Map the normalized data to RGBA (values 0.0 to 1.0)
-    colored_data = cmap(normalized_data)
-
-    # Convert to 0-255 scale uint8
-    rgba_image = (colored_data * 255).astype(np.uint8)
-
-    # 4. Inject our Nodata Mask into the Alpha channel (index 3)
-    rgba_image[:, :, 3] = alpha_mask
-
-    # 5. Convert to Base64 URI
-    pill_img = Image.fromarray(rgba_image, "RGBA")
-
-    # Optional: Resize if it exceeds MAX_DIMENSION to keep the map snappy
-    # pill_img = resize_if_too_large(pill_img, 2000)
-
-    buffered = io.BytesIO()
-    pill_img.save(buffered, format="PNG")
-    img_str = base64.b64encode(buffered.getvalue()).decode()
-    uri = f"data:image/png;base64,{img_str}"
-
-    # 6. Add to Map
-    new_layer = ImageOverlay(url=uri, bounds=bounds, name=m.layer_name, opacity=opacity)
-
-    m.add_layer(new_layer)
-
-
-def raster_to_vector(source, output, simplify_tolerance=None, dst_crs=None, **kwargs):
-    """Vectorize a raster dataset.
-
-    Args:
-        source (str): The path to the tiff file.
-        output (str): The path to the vector file.
-        simplify_tolerance (float, optional): The maximum allowed geometry displacement.
-            The higher this value, the smaller the number of vertices in the resulting geometry.
-    """
-
-    with rasterio.open(source) as src:
-        band = src.read()
-
-        mask = band != 0
-        shapes = features.shapes(band, mask=mask, transform=src.transform)
-
-    fc = [
-        {"geometry": shapely.geometry.shape(shape), "properties": {"value": value}}
-        for shape, value in shapes
-    ]
-    if simplify_tolerance is not None:
-        for i in fc:
-            i["geometry"] = i["geometry"].simplify(tolerance=simplify_tolerance)
-
-    gdf = gpd.GeoDataFrame.from_features(fc)
-    if src.crs is not None:
-        gdf.set_crs(crs=src.crs, inplace=True)
-
-    if dst_crs is not None:
-        gdf = gdf.to_crs(dst_crs)
-
-    gdf.to_file(output, **kwargs)
-
-
-def random_string(string_length=6):
-    """Generates a random string of fixed length.
-
-    Args:
-        string_length (int, optional): Fixed length. Defaults to 3.
-
-    Returns:
-        str: A random string
-    """
-    import random
-    import string
-
-    # random.seed(1001)
-    letters = string.ascii_lowercase
-    return "".join(random.choice(letters) for i in range(string_length))
-
-
-def install_package(package):
-    """Install a Python package.
-
-    Args:
-        package (str | list): The package name or a GitHub URL or a list of package names or GitHub URLs.
-    """
-    import subprocess
-
-    if isinstance(package, str):
-        packages = [package]
-
-    for package in packages:
-        if package.startswith("https://github.com"):
-            package = f"git+{package}"
-
-        # Execute pip install command and show output in real-time
-        command = f"pip install {package}"
-        process = subprocess.Popen(command.split(), stdout=subprocess.PIPE)
-
-        # Print output in real-time
-        while True:
-            if process.stdout is None:
-                break
-            output = process.stdout.readline()
-            if output == b"" and process.poll() is not None:
-                break
-            if output:
-                print(output.decode("utf-8").strip())
-
-        # Wait for process to complete
-        process.wait()
-
-
-def regularize(
-    data: Union[gpd.GeoDataFrame, str],
-    output_path: Optional[str] = None,
-    parallel_threshold: float = 1.0,
-    target_crs: Optional[Union[str, "pyproj.CRS"]] = None,
-    simplify: bool = True,
-    simplify_tolerance: float = 0.5,
-    allow_45_degree: bool = True,
-    diagonal_threshold_reduction: float = 15,
-    allow_circles: bool = True,
-    circle_threshold: float = 0.9,
-    num_cores: int = 1,
-    include_metadata: bool = False,
-    **kwargs: Any,
-) -> Any:
-    """Regularizes polygon geometries in a GeoDataFrame by aligning edges.
-
-    Aligns edges to be parallel or perpendicular (optionally also 45 degrees)
-    to their main direction. Handles reprojection, initial simplification,
-    regularization, geometry cleanup, and parallel processing.
-
-    This function is a wrapper around the `regularize_geodataframe` function
-    from the `buildingregulariser` package. Credits to the original author
-    Nick Wright. Check out the repo at https://github.com/DPIRD-DMA/Building-Regulariser.
-
-    Args:
-        data (Union[gpd.GeoDataFrame, str]): Input GeoDataFrame with polygon or multipolygon geometries,
-            or a file path to the GeoDataFrame.
-        output_path (Optional[str], optional): Path to save the output GeoDataFrame. If None, the output is
-            not saved. Defaults to None.
-        parallel_threshold (float, optional): Distance threshold for merging nearly parallel adjacent edges
-            during regularization. Defaults to 1.0.
-        target_crs (Optional[Union[str, "pyproj.CRS"]], optional): Target Coordinate Reference System for
-            processing. If None, uses the input GeoDataFrame's CRS. Processing is more reliable in a
-            projected CRS. Defaults to None.
-        simplify (bool, optional): If True, applies initial simplification to the geometry before
-            regularization. Defaults to True.
-        simplify_tolerance (float, optional): Tolerance for the initial simplification step (if `simplify`
-            is True). Also used for geometry cleanup steps. Defaults to 0.5.
-        allow_45_degree (bool, optional): If True, allows edges to be oriented at 45-degree angles relative
-            to the main direction during regularization. Defaults to True.
-        diagonal_threshold_reduction (float, optional): Reduction factor in degrees to reduce the likelihood
-            of diagonal edges being created. Larger values reduce the likelihood of diagonal edges.
-            Defaults to 15.
-        allow_circles (bool, optional): If True, attempts to detect polygons that are nearly circular and
-            replaces them with perfect circles. Defaults to True.
-        circle_threshold (float, optional): Intersection over Union (IoU) threshold used for circle detection
-            (if `allow_circles` is True). Value between 0 and 1. Defaults to 0.9.
-        num_cores (int, optional): Number of CPU cores to use for parallel processing. If 1, processing is
-            done sequentially. Defaults to 1.
-        include_metadata (bool, optional): If True, includes metadata about the regularization process in the
-            output GeoDataFrame. Defaults to False.
-
-        **kwargs: Additional keyword arguments to pass to the `to_file` method when saving the output.
-
-    Returns:
-        gpd.GeoDataFrame: A new GeoDataFrame with regularized polygon geometries. Original attributes are
-        preserved. Geometries that failed processing might be dropped.
-
-    Raises:
-        ValueError: If the input data is not a GeoDataFrame or a file path, or if the input GeoDataFrame is empty.
-    """
-    try:
-        from buildingregulariser import regularize_geodataframe
-    except ImportError:
-        install_package("buildingregulariser")
-        from buildingregulariser import regularize_geodataframe
-
-    if isinstance(data, str):
-        data = gpd.read_file(data)
-    elif not isinstance(data, gpd.GeoDataFrame):
-        raise ValueError("Input data must be a GeoDataFrame or a file path.")
-
-    # Check if the input data is empty
-    if data.empty:
-        raise ValueError("Input GeoDataFrame is empty.")
-
-    gdf = regularize_geodataframe(
-        data,
-        parallel_threshold=parallel_threshold,
-        target_crs=target_crs,
-        simplify=simplify,
-        simplify_tolerance=simplify_tolerance,
-        allow_45_degree=allow_45_degree,
-        diagonal_threshold_reduction=diagonal_threshold_reduction,
-        allow_circles=allow_circles,
-        circle_threshold=circle_threshold,
-        num_cores=num_cores,
-        include_metadata=include_metadata,
+    mask = np.where(data == Config.NODATA_VAL, 0, Config.ALPHA_FULL).astype(np.uint8)
+    valid = data != Config.NODATA_VAL
+    norm = (
+        (data - data[valid].min()) / (data[valid].max() - data[valid].min() or 1)
+        if valid.any()
+        else data
     )
 
-    if output_path:
-        gdf.to_file(output_path, **kwargs)
+    rgba = (plt.get_cmap(palette)(norm) * 255).astype(np.uint8)
+    rgba[:, :, 3] = mask
 
-    return gdf
+    buf = io.BytesIO()
+    Image.fromarray(rgba, "RGBA").save(buf, format="PNG")
+    return f"data:image/png;base64,{base64.b64encode(buf.getvalue()).decode()}"
+
+
+def create_gdf_from_shapes(geoms: List[Dict], crs: Any) -> Optional[gpd.GeoDataFrame]:
+    if not geoms:
+        return None
+    return gpd.GeoDataFrame(geoms, geometry=[g["geometry"] for g in geoms], crs=crs)
+
+
+def raster_to_vector(src_path: Path, out_path: Path, crs: Any = "EPSG:4326") -> bool:
+    with rasterio.open(src_path) as src:
+        band = src.read(1)
+        src_crs = src.crs or crs
+        shape_gen = features.shapes(band, mask=(band != 0), transform=src.transform)
+        geoms = [{"geometry": shape(s), "val": v} for s, v in shape_gen]
+
+    gdf = create_gdf_from_shapes(geoms, src_crs)
+    if gdf is None:
+        return False
+
+    # Filter out invalid or very small geometries before saving
+    gdf = gdf[gdf.is_valid & ~gdf.is_empty]
+
+    try:
+        import fiona
+
+        gdf.to_file(out_path)
+    except ImportError:
+        try:
+            gdf.to_file(out_path, engine="pyogrio")
+        except:
+            pass
+
+    return True
+
+
+# --- GUI Manager ---
+
+
+class SAMGuiManager:
+    def __init__(self, sam: SamGeo3, m: MapWrapper, bounds: MAP_BOUNDS, out_dir: Path):
+        self.sam, self.m, self.bounds, self.out_dir = sam, m, bounds, out_dir
+        self.generated_layers: List[str] = []
+        self._init_ui()
+
+    def _init_ui(self) -> None:
+        self.output = widgets.Output(
+            layout=widgets.Layout(
+                width="100%",
+                height="200px",
+                overflow="auto",
+                border="1px solid #ccc",
+                margin="10px 0",
+                padding="5px",
+            )
+        )
+        self.output.add_class("custom-logs")
+
+        self.prompt = widgets.Text(
+            description="Prompt:",
+            placeholder="e.g. building",
+            layout=widgets.Layout(width=Config.INPUT_WIDTH),
+        )
+        self.box_slid = self._create_slider("Box Thresh:", Config.DEFAULT_BOX_THRESH)
+        self.text_slid = self._create_slider("Text Thresh:", Config.DEFAULT_TEXT_THRESH)
+        self.opac_slid = self._create_slider("Opacity:", Config.DEFAULT_OPACITY)
+        self.cmap_drop = Config.PALLETE_DEFAULT
+
+        self.reg_check = widgets.Checkbox(
+            description="Regularize", value=False, indent=False
+        )
+        self.color_pick = widgets.ColorPicker(
+            description="Color",
+            value="#ffff00",
+            layout=widgets.Layout(width="180px"),
+            style={"description_width": "50px"},
+        )
+
+        self.btn_seg = widgets.Button(
+            description="Segment",
+            button_style="primary",
+            layout=widgets.Layout(width=Config.BTN_WIDTH),
+        )
+        self.btn_reset = widgets.Button(
+            description="Reset Layers",
+            button_style="warning",
+            layout=widgets.Layout(width=Config.BTN_WIDTH),
+        )
+        self.btn_clear = widgets.Button(
+            description="Clear Logs", layout=widgets.Layout(width=Config.BTN_WIDTH)
+        )
+
+        self.btn_seg.on_click(self._on_segment_click)
+        self.btn_reset.on_click(self._on_reset_click)
+        self.btn_clear.on_click(lambda _: self.output.clear_output())
+
+        display(
+            widgets.HTML(
+                "<style>.custom-logs { white-space: pre-wrap !important; word-wrap: break-word; font-family: monospace; background-color: #f9f9f9; }</style>"
+            )
+        )
+
+    def _create_slider(self, label: str, val: float) -> widgets.FloatSlider:
+        return widgets.FloatSlider(
+            description=label,
+            min=0,
+            max=1,
+            step=0.01,
+            value=val,
+            layout=widgets.Layout(width=Config.INPUT_WIDTH),
+        )
+
+    def _log(self, msg: str, err: bool = False) -> None:
+        prefix = "❌" if err else "ℹ️"
+        print(f"{prefix} {msg}", file=sys.__stdout__)
+        with self.output:
+            print(f"{prefix} {msg}")
+            write_logs(msg)
+
+    def _get_active_roi(self) -> Optional[List[float]]:
+        bounds = self.m.user_roi_bounds()
+        if bounds:
+            return bounds
+        for c in self.m.controls:
+            if isinstance(c, ipyleaflet.DrawControl) and c.data:
+                return list(shape(c.data[-1].get("geometry")).bounds)
+        return None
+
+    def _on_segment_click(self, _):
+        roi = self._get_active_roi()
+        if not self.prompt.value and not roi:
+            return self._log("No prompt or ROI detected.", True)
+
+        try:
+            self._execute_segmentation(roi)
+        except Exception as e:
+            self._log(f"Process error: {str(e)}", True)
+            traceback.print_exc(file=sys.__stdout__)
+
+    def _execute_segmentation(self, roi: Optional[List[float]]) -> None:
+        prompt_val = self.prompt.value.strip()
+        name = f"{prompt_val.replace(' ', '_') or 'mask'}_{generate_id()}"
+        tif_path = self.out_dir / f"{name}{Config.TIF_EXT}"
+
+        self.sam.confidence_threshold = self.box_slid.value
+        self.sam.mask_threshold = self.text_slid.value
+
+        has_crs = False
+        if hasattr(self.sam, "source") and self.sam.source is not None:
+            try:
+                with rasterio.open(self.sam.source) as src:
+                    if src.crs is not None:
+                        has_crs = True
+            except:
+                pass
+
+        if prompt_val:
+            self._log(f"Inference via prompt: '{prompt_val}'")
+            self.sam.generate_masks(prompt=prompt_val)
+        elif roi is not None:
+            self._log(f"Inference via ROI box: {roi}")
+            b_crs = "EPSG:4326" if has_crs else None
+            self.sam.generate_masks_by_boxes(boxes=[roi], box_crs=b_crs)
+
+        self.sam.save_masks(output=str(tif_path))
+        if not self._is_mask_valid(tif_path):
+            return self._log("SAM found no objects.", True)
+
+        self._add_raster_layer(tif_path, name)
+        if self.reg_check.value:
+            self._perform_regularization(tif_path, name)
+
+    def _is_mask_valid(self, path: Path) -> bool:
+        with rasterio.open(path) as src:
+            return bool(np.any(src.read(1) > 0))
+
+    def _add_raster_layer(self, path: Path, name: str) -> None:
+        uri = get_rgba_uri(path, self.cmap_drop, self.opac_slid.value)
+        layer = ipyleaflet.ImageOverlay(
+            url=uri, bounds=self.bounds, name=name, opacity=self.opac_slid.value
+        )
+        self.m.add_layer(layer)
+        self.generated_layers.append(name)
+        self.m.layer_name = name
+        self._log(f"Success: Layer '{name}' added.")
+
+    def _perform_regularization(self, path: Path, name: str) -> None:
+        self._log("Regularizing...")
+        v_path = path.with_suffix(Config.GPKG_EXT)
+
+        if not raster_to_vector(path, v_path):
+            return self._log("Vectorization failed to produce shapes.", True)
+
+        try:
+            gdf = gpd.read_file(v_path)
+            if gdf.empty:
+                return self._log("No vector features found to regularize.", True)
+
+            # Ensure valid geometries
+            gdf = gdf[gdf.is_valid & ~gdf.is_empty]
+
+            # Check for CRS and provide fallback if None
+            if gdf.crs is None:
+                self._log("Input GDF has no CRS. Assuming EPSG:4326.")
+                gdf.set_crs(epsg=4326, inplace=True)
+
+            original_crs = gdf.crs
+            assert (
+                original_crs is not None
+            ), "CRS should not be None for regularization."
+
+            # Regularization often works best in meters (Projected CRS)
+            # We'll project to EPSG:3857 (Web Mercator) for processing
+            gdf_m = gdf.to_crs(epsg=3857)
+
+            self._log(f"Processing {len(gdf_m)} features...")
+            reg_gdf_m = regularize_geodataframe(gdf_m)
+
+            if reg_gdf_m is None or reg_gdf_m.empty:
+                # If metric regularization fails, try the original degree-based one as fallback
+                self._log("Metric regularization yielded nothing, trying fallback...")
+                reg_gdf = regularize_geodataframe(gdf)
+            else:
+                # Convert back to original CRS for map compatibility
+
+                reg_gdf = reg_gdf_m.to_crs(original_crs)
+
+            if reg_gdf is None or reg_gdf.empty:
+                return self._log("Regularization returned empty results.", True)
+
+            self._log(f"Adding regularized layer...")
+
+            try:
+                self.m.add_gdf(
+                    reg_gdf,
+                    layer_name=f"{name}_reg",
+                    style={
+                        "color": self.color_pick.value,
+                        "fillOpacity": 0.5,
+                        "weight": 2,
+                    },
+                )
+                self.generated_layers.append(f"{name}_reg")
+                self._log("Regularization complete.")
+            except Exception as map_err:
+                self._log(f"Map rendering error: {str(map_err)}", True)
+
+        except Exception as e:
+            self._log(f"Regularization logic error: {str(e)}", True)
+            traceback.print_exc(file=sys.__stdout__)
+
+    def _on_reset_click(self, _):
+        for n in self.generated_layers:
+            layer = self.m.find_layer(n)
+            if layer:
+                self.m.remove_layer(layer)
+        self.generated_layers.clear()
+        self.m.layer_name = ""
+        self._log("Layers reset.")
+
+
+# --- UI Entry ---
 
 
 def text_sam_gui(
     sam: SamGeo3,
     m: MapWrapper,
     overlay_bounds: MAP_BOUNDS,
-    out_dir: Optional[str] = None,
-    box_threshold: float = 0.25,
-    text_threshold: float = 0.25,
-    cmap: str = "viridis",
-    opacity: float = 0.7,
-    min_size: int = 10,
-    max_size: Optional[int] = None,
-):
-    """Display the SAM Map GUI.
-
-    Args:
-        sam (SamGeo):
-        m (MapWrapper): The map to display.
-        out_dir (str, optional): The output directory. Defaults to None.
-        box_threshold (float, optional): The threshold for the box. Defaults to 0.25.
-        text_threshold (float, optional): The threshold for the text. Defaults to 0.25.
-        cmap (str, optional): The colormap to use. Defaults to "viridis".
-        opacity (float, optional): The opacity of the mask. Defaults to 0.7.
-        min_size (int, optional): The minimum size of the object. Defaults to 10.
-        max_size (int, optional): The maximum size of the object. Defaults to None.
-
+    out_dir: Optional[Path] = None,
+) -> widgets.VBox:
     """
-    try:
-        import shutil
-        import tempfile
+    Returns a VBox containing the Map at the top and the SAM Controls/Logs below.
+    """
+    out = Path(out_dir) if out_dir else Path(tempfile.gettempdir())
+    out.mkdir(parents=True, exist_ok=True)
+    gui = SAMGuiManager(sam, m, overlay_bounds, out)
 
-        import ipyevents
-        import ipyleaflet
-        import ipywidgets as widgets
-        import leafmap.colormaps as cm
-        from ipyfilechooser import FileChooser
-    except ImportError:
-        raise ImportError(
-            "The sam_map function requires the leafmap package. Please install it first."
-        )
-
-    if out_dir is None:
-        out_dir = tempfile.gettempdir()
-
-    # m = MapWrapper(**kwargs)
-    m.default_style = {"cursor": "crosshair"}
-
-    widget_width = "280px"
-    button_width = "90px"
-    padding = "0px 4px 0px 4px"  # upper, right, bottom, left
-    style = {"description_width": "initial"}
-
-    toolbar_button = widgets.ToggleButton(
-        value=True,
-        tooltip="Toolbar",
-        icon="gear",
-        layout=widgets.Layout(width="28px", height="28px", padding="0px 0px 0px 4px"),
+    # UI Panel Layout
+    controls_box = widgets.VBox(
+        [
+            widgets.HTML("<h3>SAM v3 Controls</h3>"),
+            widgets.HBox(
+                [
+                    widgets.VBox([gui.prompt, gui.box_slid, gui.text_slid]),
+                    widgets.VBox(
+                        [
+                            gui.opac_slid,
+                            widgets.HBox([gui.reg_check, gui.color_pick]),
+                        ]
+                    ),
+                ]
+            ),
+            widgets.HBox(
+                [gui.btn_seg, gui.btn_reset, gui.btn_clear],
+                layout=widgets.Layout(margin="10px 0"),
+            ),
+            gui.output,
+        ],
+        layout=widgets.Layout(padding="15px", border="1px solid #ddd", margin="10px 0"),
     )
 
-    close_button = widgets.ToggleButton(
-        value=False,
-        tooltip="Close the tool",
-        icon="times",
-        button_style="primary",
-        layout=widgets.Layout(height="28px", width="28px", padding="0px 0px 0px 4px"),
-    )
-
-    text_prompt = widgets.Text(
-        description="Text prompt:",
-        style=style,
-        layout=widgets.Layout(width=widget_width, padding=padding),
-    )
-
-    box_slider = widgets.FloatSlider(
-        description="Box threshold:",
-        min=0,
-        max=1,
-        value=box_threshold,
-        step=0.01,
-        readout=True,
-        continuous_update=True,
-        layout=widgets.Layout(width=widget_width, padding=padding),
-        style=style,
-    )
-
-    if sam.model_version == "sam3":
-        box_slider.description = "Conf. threshold:"
-
-    text_slider = widgets.FloatSlider(
-        description="Text threshold:",
-        min=0,
-        max=1,
-        step=0.01,
-        value=text_threshold,
-        readout=True,
-        continuous_update=True,
-        layout=widgets.Layout(width=widget_width, padding=padding),
-        style=style,
-    )
-
-    if sam.model_version == "sam3":
-        text_slider.description = "Mask threshold:"
-
-    cmap_dropdown = widgets.Dropdown(
-        description="Palette:",
-        options=cm.list_colormaps(),
-        value=cmap,
-        style=style,
-        layout=widgets.Layout(width=widget_width, padding=padding),
-    )
-
-    opacity_slider = widgets.FloatSlider(
-        description="Opacity:",
-        min=0,
-        max=1,
-        value=opacity,
-        readout=True,
-        continuous_update=True,
-        layout=widgets.Layout(width=widget_width, padding=padding),
-        style=style,
-    )
-
-    def opacity_changed(change):
-        if change["new"]:
-            mask_layer = m.find_layer(m.layer_name)
-            if mask_layer is not None:
-                mask_layer.interact(opacity=opacity_slider.value)
-
-    opacity_slider.observe(opacity_changed, "value")
-
-    rectangular = widgets.Checkbox(
-        value=False,
-        description="Regularize",
-        layout=widgets.Layout(width="130px", padding=padding),
-        style=style,
-    )
-
-    colorpicker = widgets.ColorPicker(
-        concise=False,
-        description="Color",
-        value="#ffff00",
-        layout=widgets.Layout(width="140px", padding=padding),
-        style=style,
-    )
-
-    segment_button = widgets.ToggleButton(
-        description="Segment",
-        value=False,
-        button_style="primary",
-        layout=widgets.Layout(padding=padding),
-    )
-
-    save_button = widgets.ToggleButton(
-        description="Save", value=False, button_style="primary"
-    )
-
-    reset_button = widgets.ToggleButton(
-        description="Reset", value=False, button_style="primary"
-    )
-    segment_button.layout.width = button_width
-    save_button.layout.width = button_width
-    reset_button.layout.width = button_width
-
-    output = widgets.Output(
-        layout=widgets.Layout(
-            width=widget_width, padding=padding, max_width=widget_width
-        )
-    )
-
-    toolbar_header = widgets.HBox()
-    toolbar_header.children = [close_button, toolbar_button]
-    toolbar_footer = widgets.VBox()
-    toolbar_footer.children = [
-        text_prompt,
-        box_slider,
-        text_slider,
-        cmap_dropdown,
-        opacity_slider,
-        widgets.HBox([rectangular, colorpicker]),
-        widgets.HBox(
-            [segment_button, save_button, reset_button],
-            layout=widgets.Layout(padding="0px 4px 0px 4px"),
-        ),
-        output,
-    ]
-    toolbar_widget = widgets.VBox()
-    toolbar_widget.children = [toolbar_header, toolbar_footer]
-
-    toolbar_event = ipyevents.Event(
-        source=toolbar_widget, watched_events=["mouseenter", "mouseleave"]
-    )
-
-    def handle_toolbar_event(event):
-        if event["type"] == "mouseenter":
-            toolbar_widget.children = [toolbar_header, toolbar_footer]
-        elif event["type"] == "mouseleave":
-            if not toolbar_button.value:
-                toolbar_widget.children = [toolbar_button]
-                toolbar_button.value = False
-                close_button.value = False
-
-    toolbar_event.on_dom_event(handle_toolbar_event)
-
-    def toolbar_btn_click(change):
-        if change["new"]:
-            close_button.value = False
-            toolbar_widget.children = [toolbar_header, toolbar_footer]
-        else:
-            if not close_button.value:
-                toolbar_widget.children = [toolbar_button]
-
-    toolbar_button.observe(toolbar_btn_click, "value")
-
-    def close_btn_click(change):
-        if change["new"]:
-            toolbar_button.value = False
-            if m.toolbar_control in m.controls:
-                m.remove_control(m.toolbar_control)
-            toolbar_widget.close()
-
-    close_button.observe(close_btn_click, "value")
-
-    def segment_button_click(change):
-        if change["new"]:
-            segment_button.value = False
-            with output:
-                output.clear_output()
-                if len(text_prompt.value) == 0 and m.user_roi_bounds() is None:
-                    print(
-                        "Please enter a text prompt or draw a region of interest first."
-                    )
-                elif sam.source is None:
-                    print("Please run sam.set_image() first.")
-                else:
-                    print("Segmenting...")
-                    if len(text_prompt.value) > 0:
-                        layer_name = text_prompt.value.replace(" ", "_")
-                    elif m.user_roi_bounds() is not None:
-                        layer_name = "masks"
-
-                    filename = os.path.join(
-                        out_dir, f"{layer_name}_{random_string()}.tif"
-                    )
-                    try:
-                        if sam.model_version == "sam3":
-                            sam.confidence_threshold = box_slider.value
-                            sam.mask_threshold = text_slider.value
-                            if len(text_prompt.value) > 0:
-                                sam.generate_masks(
-                                    prompt=text_prompt.value,
-                                    min_size=min_size,
-                                    max_size=max_size,
-                                )
-                            elif m.user_roi_bounds() is not None:
-                                sam.generate_masks_by_boxes(
-                                    boxes=[m.user_roi_bounds()],
-                                    box_crs="EPSG:4326",
-                                    min_size=min_size,
-                                    max_size=max_size,
-                                )
-                            else:
-                                print(
-                                    "Please enter a text prompt or draw a region of interest first."
-                                )
-                                return
-                            sam.save_masks(output=filename)
-                        else:
-                            print(
-                                f"Unknown or unsupported model_version: {getattr(sam, 'model_version', None)}. Please set sam.model_version to 'sam2' or 'sam3'."
-                            )
-                            return
-                        # TODO: add .output attribute to sam object
-                        sam.output = filename  # type: ignore - dynamically adding attribute
-                        if m.find_layer(layer_name) is not None:
-                            m.remove_layer(m.find_layer(layer_name))
-                        if m.find_layer(f"{layer_name}_rect") is not None:
-                            m.remove_layer(m.find_layer(f"{layer_name} Regularized"))
-
-                    except Exception as e:
-                        output.clear_output()
-                        print(e)
-                        raise e
-                    if os.path.exists(filename):
-                        print("file exists, displaying the results...")
-                        try:
-                            print("Displaying the results on the map.")
-                            add_offline_raster(
-                                m=m,
-                                tif_path=filename,
-                                bounds=overlay_bounds,
-                                opacity=opacity_slider.value,
-                                palette=cmap_dropdown.value,
-                                nodata=0,
-                            )
-                            m.layer_name = layer_name
-                            print("Displayed the results on the map.")
-                            if rectangular.value:
-                                print("Regularizing the vector...")
-                                vector = filename.replace(".tif", ".gpkg")
-                                vector_rec = filename.replace(".tif", "_rect.gpkg")
-                                raster_to_vector(filename, vector)
-                                regularize(vector, vector_rec)
-                                vector_style = {"color": colorpicker.value}
-                                m.add_vector(
-                                    vector_rec,
-                                    layer_name=f"{layer_name} Regularized",
-                                    style=vector_style,
-                                    info_mode=None,
-                                    zoom_to_layer=False,
-                                )
-
-                                print("saved regularized vector.")
-                            print("Clearing output.")
-                            output.clear_output()
-                            print("Cleared output.")
-
-                            if sam.model_version == "sam3":
-                                if sam.masks is not None:
-                                    print(f"Found {len(sam.masks)} objects.")
-                                else:
-                                    print("No objects found.")
-                        except Exception as e:
-                            logging.error(e)
-                            print(e)
-                            with open("sam_map_error.log", "a") as log_file:
-                                log_file.write(f"{e}\n")
-                            raise e
-                    else:
-                        print("Segmentation failed. No output file generated.")
-
-    segment_button.observe(segment_button_click, "value")
-
-    def filechooser_callback(chooser):
-        with output:
-            if chooser.selected is not None:
-                try:
-                    filename = chooser.selected
-                    shutil.copy(sam.output, filename)  # type: ignore - dynamically added attribute
-                    vector = filename.replace(".tif", ".gpkg")
-                    raster_to_vector(filename, vector)
-                    if rectangular.value:
-                        vector_rec = filename.replace(".tif", "_rect.gpkg")
-                        regularize(vector, vector_rec)
-                except Exception as e:
-                    print(e)
-
-                if m.save_control in m.controls:
-                    m.remove_control(m.save_control)
-                    delattr(m, "save_control")
-                save_button.value = False
-
-    def save_button_click(change):
-        if change["new"]:
-            with output:
-                output.clear_output()
-                if not hasattr(m, "layer_name"):
-                    print("Please click the Segment button first.")
-                else:
-                    sandbox_path = os.environ.get("SANDBOX_PATH")
-                    filechooser = FileChooser(
-                        path=os.getcwd(),
-                        filename=f"{m.layer_name}.tif",
-                        sandbox_path=sandbox_path,
-                        layout=widgets.Layout(width="454px"),
-                    )
-                    filechooser.use_dir_icons = True
-                    filechooser.filter_pattern = ["*.tif"]
-                    filechooser.register_callback(filechooser_callback)
-                    save_control = ipyleaflet.WidgetControl(
-                        widget=filechooser, position="topright"
-                    )
-                    m.add_control(save_control)
-                    m.save_control = save_control
-
-        else:
-            if m.save_control in m.controls:
-                m.remove_control(m.save_control)
-                delattr(m, "save_control")
-
-    save_button.observe(save_button_click, "value")
-
-    def reset_button_click(change):
-        if change["new"]:
-            segment_button.value = False
-            save_button.value = False
-            reset_button.value = False
-            opacity_slider.value = 0.7
-            model_version = getattr(sam, "model_version", "sam2")
-            if model_version == "sam2":
-                box_slider.value = 0.25
-                text_slider.value = 0.25
-            elif model_version == "sam3":
-                box_slider.value = 0.5
-                text_slider.value = 0.5
-            cmap_dropdown.value = "viridis"
-            text_prompt.value = ""
-            output.clear_output()
-            try:
-                if m.find_layer(m.layer_name) is not None:
-                    m.remove_layer(m.find_layer(m.layer_name))
-                m.clear_drawings()
-            except:
-                pass
-
-    reset_button.observe(reset_button_click, "value")
-
-    toolbar_control = ipyleaflet.WidgetControl(
-        widget=toolbar_widget, position="topright"
-    )
-    m.add_control(toolbar_control)
-    m.toolbar_control = toolbar_control
-
-    return m
+    # Return Map and Controls in a vertical layout
+    return widgets.VBox([m, controls_box])
