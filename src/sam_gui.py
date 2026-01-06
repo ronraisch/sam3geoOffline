@@ -24,9 +24,10 @@ from samgeo import SamGeo3
 from IPython.display import display
 
 # Custom modularized imports
-from src.utils import MAP_BOUNDS, generate_id, write_logs
+from src.utils import generate_id, write_logs
 from buildingregulariser import regularize_geodataframe
 
+from src.create_overlay_map import MapBounds
 
 # --- Configuration & Constants ---
 
@@ -120,7 +121,7 @@ def raster_to_vector(src_path: Path, out_path: Path, crs: Any = "EPSG:4326") -> 
 
 
 class SAMGuiManager:
-    def __init__(self, sam: SamGeo3, m: MapWrapper, bounds: MAP_BOUNDS, out_dir: Path):
+    def __init__(self, sam: SamGeo3, m: MapWrapper, bounds: MapBounds, out_dir: Path):
         self.sam, self.m, self.bounds, self.out_dir = sam, m, bounds, out_dir
         self.generated_layers: List[str] = []
         self._init_ui()
@@ -259,7 +260,10 @@ class SAMGuiManager:
     def _add_raster_layer(self, path: Path, name: str) -> None:
         uri = get_rgba_uri(path, self.cmap_drop, self.opac_slid.value)
         layer = ipyleaflet.ImageOverlay(
-            url=uri, bounds=self.bounds, name=name, opacity=self.opac_slid.value
+            url=uri,
+            bounds=self.bounds.to_leaflet(),
+            name=name,
+            opacity=self.opac_slid.value,
         )
         self.m.add_layer(layer)
         self.generated_layers.append(name)
@@ -347,7 +351,7 @@ class SAMGuiManager:
 def text_sam_gui(
     sam: SamGeo3,
     m: MapWrapper,
-    overlay_bounds: MAP_BOUNDS,
+    overlay_bounds: MapBounds,
     out_dir: Optional[Path] = None,
 ) -> widgets.VBox:
     """
