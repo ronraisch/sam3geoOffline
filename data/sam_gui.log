@@ -54,3 +54,21 @@
 [2026-01-06T11:04:17.112201] Initiating regularization...
 [2026-01-06T11:04:17.831693] Regularizing 2233 features...
 [2026-01-06T11:04:19.685053] Regularization complete.
+[2026-01-06T11:12:50.852185] Segmenting ROI box: [34.579788, 31.415784, 34.579865, 31.415837]
+[2026-01-06T11:12:53.928825] Layer 'mask_bvqnfz' added.
+[2026-01-06T11:13:40.352256] Segmenting ROI box: [34.578514, 31.414625, 34.578514, 31.414625]
+[2026-01-06T11:13:42.974831] Layer 'mask_zdfokw' added.
+[2026-01-06T11:14:06.778897] Segmenting ROI box: [34.577142, 31.416417, 34.577275, 31.41653]
+[2026-01-06T11:14:09.352192] Layer 'mask_hmhdsz' added.
+[2026-01-06T12:20:18.910398] Segmenting prompt: 'road'
+[2026-01-06T12:20:20.586464] Pipeline failed: Attempt to create new tiff file '/var/tmp/road_data/example/netivot1.tif_xqoitb.tif' failed: /var/tmp/road_data/example/netivot1.tif_xqoitb.tif: No such file or directory
+[2026-01-06T12:26:41.211144] Segmenting prompt: 'road'
+[2026-01-06T12:26:43.447235] Layer 'road_data_example_netivot1.tif_ztasnd' added.
+[2026-01-06T12:27:20.070401] Segmenting prompt: 'red roof'
+[2026-01-06T12:27:23.857912] Layer 'red_roof_data_example_netivot1.tif_qycpqc' added.
+[2026-01-06T12:27:52.730002] Segmenting prompt: 'umbrella'
+[2026-01-06T12:27:54.022048] Layer 'umbrella_data_example_netivot1.tif_adyclx' added.
+[2026-01-06T12:28:24.737895] Segmenting prompt: 'solar panel'
+[2026-01-06T12:28:25.781786] Layer 'solar_panel_data_example_netivot1.tif_bjwqvm' added.
+[2026-01-06T12:30:42.110649] Segmenting prompt: 'parking lot'
+[2026-01-06T12:30:43.706821] Layer 'parking_lot_data_example_netivot1.tif_ubxcgr' added.

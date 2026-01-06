@@ -1,6 +1,7 @@
 import logging
 import io
 import base64
+import os
 import tempfile
 import sys
 import traceback
@@ -26,7 +27,7 @@ from IPython.display import display
 # Custom modularized imports
 from src.utils import generate_id, write_logs
 from buildingregulariser import regularize_geodataframe
-from src.create_overlay_map import MapBounds
+from src.create_overlay_map import MapBounds, OverlayConfig, create_geotiff_map
 
 # --- Configuration & Constants ---
 
@@ -141,20 +142,11 @@ class UIFactory:
         )
 
 
-# --- Map & Layer Wrapper ---
-
-
-class MapWrapper(leafmap.Map):
-    def __init__(self, m: leafmap.Map, **kwargs: Any):
-        super().__init__(**kwargs)
-        self.__dict__.update(m.__dict__)
-
-
 # --- GUI Manager ---
 
 
 class SAMGuiManager:
-    def __init__(self, sam: SamGeo3, m: MapWrapper, bounds: MapBounds, out_dir: Path):
+    def __init__(self, sam: SamGeo3, m: leafmap.Map, bounds: MapBounds, out_dir: Path):
         self.sam = sam
         self.m = m
         self.bounds = bounds
@@ -247,11 +239,23 @@ class SAMGuiManager:
             self._log(f"Pipeline failed: {str(e)}", is_error=True)
             traceback.print_exc(file=sys.__stdout__)
 
+    def _get_base_name(self, prompt_text: str) -> str:
+        """Generates a unique base name for output files."""
+        unique_id = generate_id()
+        if isinstance(self.sam.source, str):
+            img_name = self.sam.source.replace(os.path.sep, "_")
+        else:
+            img_name = "unknown"
+        base_name = (
+            f"{prompt_text.replace(' ', '_') or 'poly_mask'}_{img_name}_{unique_id}"
+        )
+        return base_name
+
     def _run_inference_pipeline(self, roi: Optional[List[float]]) -> None:
         """Handles mask generation, saving, and rendering."""
         prompt_text = self.prompt.value.strip()
         unique_id = generate_id()
-        base_name = f"{prompt_text.replace(' ', '_') or 'mask'}_{unique_id}"
+        base_name = self._get_base_name(prompt_text)
         tif_path = self.out_dir / f"{base_name}{Config.TIF_EXT}"
 
         # Setup SAM params
@@ -372,15 +376,17 @@ class SAMGuiManager:
 
 def text_sam_gui(
     sam: SamGeo3,
-    m: MapWrapper,
-    overlay_bounds: MapBounds,
+    overlays: List[OverlayConfig],
+    base_map_path: Union[Path, str],
     out_dir: Optional[Path] = None,
 ) -> widgets.VBox:
     """Entry point to create the SAM v3 Integrated UI."""
     temp_dir = Path(out_dir) if out_dir else Path(tempfile.gettempdir())
     temp_dir.mkdir(parents=True, exist_ok=True)
 
-    gui = SAMGuiManager(sam, m, overlay_bounds, temp_dir)
+    m = create_geotiff_map(base_map_path, overlays)
+
+    gui = SAMGuiManager(sam, m, overlays[0].bounds, temp_dir)
 
     panel = widgets.VBox(
         [
