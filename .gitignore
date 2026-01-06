@@ -36,3 +36,4 @@ htmlcov/
 .pytype/
 .pyright/
 .ipynb_checkpoints/ 
+data/sam_gui.log
