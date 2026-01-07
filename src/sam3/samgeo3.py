@@ -1,11 +1,11 @@
 """Segmenting remote sensing images with the Segment Anything Model 3 (SAM3).
-Optimized for batch processing, prompt sharing, and visual prompts with strict type hinting.
+Optimized for batch processing, modularity, and efficient geospatial conversion.
 """
 
 import os
 import gc
 import hashlib
-from typing import Dict, List, Optional, Tuple, Union, TypedDict
+from typing import Dict, List, Optional, Tuple, Union, TypedDict, Any
 
 import cv2
 import numpy as np
@@ -13,13 +13,14 @@ from PIL import Image
 import rasterio
 from rasterio import features
 from rasterio.io import DatasetReader
+from shapely.geometry import shape, Polygon
 import torch
 from tqdm import tqdm
 
 try:
     from transformers import (
         Sam3Model,  # pyright: ignore[reportAttributeAccessIssue, reportMissingImports]
-        Sam3Processor as TransformersSam3Processor,  # pyright: ignore[reportAttributeAccessIssue, reportMissingImports]
+        Sam3Processor,  # pyright: ignore[reportAttributeAccessIssue, reportMissingImports]
     )
 
     SAM3_TRANSFORMERS_AVAILABLE = True
@@ -28,7 +29,6 @@ except ImportError:
 
 try:
     import geopandas as gpd
-    from shapely.geometry import shape
 
     HAS_GEOSPATIAL_LIBS = True
 except ImportError:
@@ -43,11 +43,11 @@ class PredictionResult(TypedDict):
     masks: List[np.ndarray]
     boxes: List[np.ndarray]
     scores: List[float]
-    source: Optional[str]  # Tracks the original file path or ID for metadata
+    source: Optional[str]
 
 
 class SamGeo3:
-    """The main class for segmenting geospatial data with SAM3 (Transformers backend)."""
+    """The main class for segmenting geospatial data with SAM3."""
 
     def __init__(
         self,
@@ -57,424 +57,306 @@ class SamGeo3:
         mask_threshold: float = 0.25,
     ) -> None:
         if not SAM3_TRANSFORMERS_AVAILABLE:
-            raise ImportError(
-                "Transformers SAM3 is not available. Please install it as:\n\tpip install transformers torch"
-            )
+            raise ImportError("SAM3 Transformers backend not found.")
 
-        if device is None:
-            device = str(common.get_device())
+        self.device = device or str(common.get_device())
+        self.confidence_threshold = confidence_threshold
+        self.mask_threshold = mask_threshold
 
-        self.device: str = device
-        self.confidence_threshold: float = confidence_threshold
-        self.mask_threshold: float = mask_threshold
-        self.model_id: str = model_id
+        self.model: Sam3Model = Sam3Model.from_pretrained(model_id).to(self.device)
+        self.processor: Sam3Processor = Sam3Processor.from_pretrained(model_id)
 
-        # Initialize Backend
-        self.model: Sam3Model = Sam3Model.from_pretrained(model_id).to(device)
-        self.processor: TransformersSam3Processor = (
-            TransformersSam3Processor.from_pretrained(model_id)
-        )
-
-        # State management
+        # Session State
         self.masks: Optional[List[np.ndarray]] = None
         self.boxes: Optional[List[np.ndarray]] = None
         self.scores: Optional[List[float]] = None
-        self.image: Optional[np.ndarray] = None
         self.source: Optional[str] = None
-        self.image_height: Optional[int] = None
-        self.image_width: Optional[int] = None
         self.pil_image: Optional[Image.Image] = None
 
-    def _get_image_id(self, img: Union[np.ndarray, Image.Image, str]) -> str:
-        """Generates a unique string identifier for an image input."""
-        if isinstance(img, str):
-            return os.path.basename(img)
-
-        # Hash pixel data for non-path inputs
-        if isinstance(img, Image.Image):
-            data = np.array(img).tobytes()
-        else:
-            data = img.tobytes()
-        return hashlib.md5(data).hexdigest()[:12]
+    # --- Image Handling ---
 
     def set_image(
         self,
         image_input: Union[str, np.ndarray, Image.Image],
         bands: Optional[List[int]] = None,
     ) -> None:
-        """Set the current image and prepare for inference."""
-        if isinstance(image_input, str):
-            self._set_image_with_string(image_input, bands=bands)
-        elif isinstance(image_input, np.ndarray):
-            self.image = image_input
-            self.source = None
-        elif isinstance(image_input, Image.Image):
-            self.image = np.array(image_input)
-            self.source = None
+        """Sets the current image for single-image operations."""
+        self.source = image_input if isinstance(image_input, str) else None
+        self.pil_image = self._to_pil(image_input, bands=bands)
+        if self.pil_image is None:
+            raise ValueError("Failed to load or convert image input.")
 
-        if self.image is None:
-            raise ValueError("Failed to load image.")
+    def _to_pil(
+        self,
+        img_input: Union[np.ndarray, Image.Image, str],
+        bands: Optional[List[int]] = None,
+    ) -> Image.Image:
+        """Converts various inputs to a standard RGB PIL Image."""
+        if isinstance(img_input, Image.Image):
+            return img_input.convert("RGB")
 
-        self.image_height, self.image_width = self.image.shape[:2]
-        self.pil_image = Image.fromarray(self.image)
+        if isinstance(img_input, np.ndarray):
+            return Image.fromarray(img_input).convert("RGB")
 
-    def _set_image_with_string(
-        self, image_path: str, bands: Optional[List[int]] = None
-    ) -> None:
-        """Internal helper for loading images from path."""
-        if image_path.startswith("http"):
-            image_path = str(common.download_file(image_path))
+        if isinstance(img_input, str):
+            return self._load_from_path(img_input, bands)
 
-        if not os.path.exists(image_path):
-            raise ValueError(f"Path {image_path} does not exist.")
+        raise TypeError(f"Unsupported image type: {type(img_input)}")
 
-        self.source = image_path
-        if image_path.lower().endswith((".tif", ".tiff")):
-            with rasterio.open(image_path) as src:
-                src: DatasetReader
-                if bands is not None:
-                    array: np.ndarray = np.stack([src.read(b) for b in bands], axis=0)
-                else:
-                    array: np.ndarray = (
-                        src.read()[:3, :, :]
-                        if src.count >= 3
-                        else np.repeat(src.read(1)[None, :, :], 3, axis=0)
+    def _load_from_path(
+        self, path: str, bands: Optional[List[int]] = None
+    ) -> Image.Image:
+        """Internal helper for loading images from local or remote paths."""
+        if path.startswith("http"):
+            path = str(common.download_file(path))
+
+        if path.lower().endswith((".tif", ".tiff")):
+            try:
+                with rasterio.open(path) as src:
+                    arr = src.read(bands) if bands else src.read()[:3]
+                    arr = arr.astype(np.float32)
+                    arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-6)
+                    return Image.fromarray(
+                        (arr.transpose(1, 2, 0) * 255).astype(np.uint8)
                     )
+            except Exception:
+                # Fallback for standard images if rasterio fails
+                pass
 
-                # Normalize and transpose
-                array_f: np.ndarray = array.astype(np.float32)
-                array_f -= array_f.min()
-                max_val: float = float(array_f.max())
-                if max_val > 0:
-                    array_f /= max_val
-                self.image = (array_f.transpose(1, 2, 0) * 255).astype(np.uint8)
-        else:
-            loaded_img: Optional[np.ndarray] = cv2.imread(image_path)
-            if loaded_img is None:
-                raise ValueError(f"CV2 failed to load {image_path}")
-            self.image = cv2.cvtColor(loaded_img, cv2.COLOR_BGR2RGB)
+        img = cv2.imread(path)
+        if img is None:
+            raise IOError(f"Could not read image at {path}")
+        return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
-    def _free_vram(self, full_cleanup: bool = False) -> None:
-        """Explicitly clear VRAM to avoid memory leaks."""
-        if full_cleanup:
-            self.model.cpu()
-            self.masks = None
-            self.boxes = None
-            self.scores = None
+    def _get_image_id(self, img: Any) -> str:
+        """Returns filename if string, or hash if image data."""
+        if isinstance(img, str):
+            return os.path.basename(img)
+        data = np.array(img).tobytes()
+        return hashlib.md5(data).hexdigest()[:12]
 
-        gc.collect()
+    # --- Core Inference Engine ---
 
-        if "cuda" in self.device:
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
-        elif "mps" in self.device:
-            torch.mps.empty_cache()
-
-        if full_cleanup:
-            self.model.to(self.device)
-
-    def predict_batch_text(
+    def _execute_batch(
         self,
-        images: List[Union[np.ndarray, Image.Image, str]],
-        prompts: Union[str, List[str]],
-        batch_size: int = 4,
-        clear_model_weights: bool = False,
-    ) -> Dict[str, PredictionResult]:
-        """Perform batch prediction using text prompts. Returns results keyed by image identifier."""
-        num_images: int = len(images)
-        if isinstance(prompts, str):
-            prompts_list: List[str] = [prompts] * num_images
-        else:
-            prompts_list = prompts
+        batch_imgs: List[Any],
+        processor_kwargs: Dict[str, Any],
+        clear_vram: bool = False,
+    ) -> List[PredictionResult]:
+        """Handles the heavy lifting of a single batch forward pass."""
+        pil_imgs = [self._to_pil(img) for img in batch_imgs]
+        target_sizes = [[img.height, img.width] for img in pil_imgs]
 
-        if len(images) != len(prompts_list):
-            raise ValueError("Number of images must match number of prompts.")
+        # SAM3 requires a text prompt (or empty string) even for box-only prompts
+        if "text" not in processor_kwargs:
+            processor_kwargs["text"] = [""] * len(batch_imgs)
 
-        all_results: Dict[str, PredictionResult] = {}
-        for i in tqdm(
-            range(0, num_images, batch_size), desc="SAM3 Text Batch", unit="batch"
-        ):
-            batch_slice = slice(i, i + batch_size)
-            batch_imgs = images[batch_slice]
-            batch_prompts = prompts_list[batch_slice]
-            batch_ids = [self._get_image_id(img) for img in batch_imgs]
+        inputs = self.processor(
+            images=pil_imgs, **processor_kwargs, return_tensors="pt"
+        ).to(self.device)
 
-            pil_imgs: List[Image.Image] = [self._to_pil(img) for img in batch_imgs]
-            target_sizes: List[List[int]] = [
-                [img.height, img.width] for img in pil_imgs
-            ]
+        with torch.no_grad():
+            outputs = self.model(**inputs)
 
-            inputs = self.processor(
-                images=pil_imgs, text=batch_prompts, return_tensors="pt"
-            ).to(self.device)
-
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-
-            batch_out: List[Dict[str, torch.Tensor]] = (
-                self.processor.post_process_instance_segmentation(
-                    outputs,
-                    threshold=self.confidence_threshold,
-                    mask_threshold=self.mask_threshold,
-                    target_sizes=target_sizes,
-                )
-            )
-
-            formatted = self._format_results(batch_out)
-            for j, (img_id, res) in enumerate(zip(batch_ids, formatted)):
-                # Attach source path if it exists for geospatial metadata
-                original_input = batch_imgs[j]
-                res["source"] = (
-                    original_input if isinstance(original_input, str) else None
-                )
-                all_results[img_id] = res
-
-            del inputs, outputs, batch_out
-            self._free_vram(full_cleanup=clear_model_weights)
-
-        return all_results
-
-    def predict_batch_image_prompt(
-        self,
-        images: List[Union[np.ndarray, Image.Image, str]],
-        prompt_image: Union[np.ndarray, Image.Image, str],
-        batch_size: int = 4,
-        clear_model_weights: bool = False,
-    ) -> Dict[str, PredictionResult]:
-        """Perform batch prediction using visual prompt. Returns results keyed by image identifier."""
-        num_images: int = len(images)
-        pil_prompt: Image.Image = self._to_pil(prompt_image)
-        all_results: Dict[str, PredictionResult] = {}
-
-        for i in tqdm(range(0, num_images, batch_size), desc="SAM3 Visual Batch"):
-            batch_slice = slice(i, i + batch_size)
-            batch_imgs = images[batch_slice]
-            batch_ids = [self._get_image_id(img) for img in batch_imgs]
-
-            pil_imgs: List[Image.Image] = [self._to_pil(img) for img in batch_imgs]
-            target_sizes: List[List[int]] = [
-                [img.height, img.width] for img in pil_imgs
-            ]
-            batch_prompt_images: List[Image.Image] = [pil_prompt] * len(pil_imgs)
-
-            inputs = self.processor(
-                images=pil_imgs, prompt_images=batch_prompt_images, return_tensors="pt"
-            ).to(self.device)
-
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-
-            batch_out: List[Dict[str, torch.Tensor]] = (
-                self.processor.post_process_instance_segmentation(
-                    outputs,
-                    threshold=self.confidence_threshold,
-                    mask_threshold=self.mask_threshold,
-                    target_sizes=target_sizes,
-                )
-            )
-
-            formatted = self._format_results(batch_out)
-            for j, (img_id, res) in enumerate(zip(batch_ids, formatted)):
-                original_input = batch_imgs[j]
-                res["source"] = (
-                    original_input if isinstance(original_input, str) else None
-                )
-                all_results[img_id] = res
-
-            del inputs, outputs, batch_out
-            self._free_vram(full_cleanup=clear_model_weights)
-
-        return all_results
-
-    def predict_batch_boxes(
-        self,
-        images: List[Union[np.ndarray, Image.Image, str]],
-        boxes: List[List[List[float]]],
-        batch_size: int = 4,
-        clear_model_weights: bool = False,
-    ) -> Dict[str, PredictionResult]:
-        """Perform batch prediction using bounding box prompts. Returns results keyed by image identifier."""
-        if len(images) != len(boxes):
-            raise ValueError("Number of images must match list of box prompts.")
-
-        all_results: Dict[str, PredictionResult] = {}
-        for i in tqdm(range(0, len(images), batch_size), desc="SAM3 Box Batch"):
-            batch_slice = slice(i, i + batch_size)
-            batch_imgs = images[batch_slice]
-            batch_boxes = boxes[batch_slice]
-            batch_ids = [self._get_image_id(img) for img in batch_imgs]
-
-            pil_imgs: List[Image.Image] = [self._to_pil(img) for img in batch_imgs]
-            target_sizes: List[List[int]] = [
-                [img.height, img.width] for img in pil_imgs
-            ]
-
-            inputs = self.processor(
-                images=pil_imgs, input_boxes=batch_boxes, return_tensors="pt"
-            ).to(self.device)
-
-            with torch.no_grad():
-                outputs = self.model(**inputs)
-
-            batch_out: List[Dict[str, torch.Tensor]] = (
-                self.processor.post_process_instance_segmentation(
-                    outputs,
-                    threshold=self.confidence_threshold,
-                    mask_threshold=self.mask_threshold,
-                    target_sizes=target_sizes,
-                )
-            )
-
-            formatted = self._format_results(batch_out)
-            for j, (img_id, res) in enumerate(zip(batch_ids, formatted)):
-                original_input = batch_imgs[j]
-                res["source"] = (
-                    original_input if isinstance(original_input, str) else None
-                )
-                all_results[img_id] = res
-
-            del inputs, outputs, batch_out
-            self._free_vram(full_cleanup=clear_model_weights)
-
-        return all_results
-
-    def results_to_gdf(
-        self,
-        results: Dict[str, PredictionResult],
-        # simplify_tolerance: float = 0.0, # TODO: make it work
-    ) -> Optional["gpd.GeoDataFrame"]:
-        """
-        Processes batch results to create a GeoDataFrame.
-        For keys representing .tif files, it uses the embedded coordinate systems.
-        """
-        if not HAS_GEOSPATIAL_LIBS:
-            raise ImportError("geopandas and shapely are required for this method.")
-
-        all_geoms: List[shape] = []
-        all_ids: List[str] = []
-        all_scores: List[float] = []
-        target_crs = None
-
-        for img_id, res in results.items():
-            source_path = res.get("source")
-
-            # Skip if we don't have a file path to pull coordinates from
-            if not source_path or not os.path.exists(source_path):
-                continue
-
-            # Only support .tif/.tiff for spatial metadata currently
-            if not source_path.lower().endswith((".tif", ".tiff")):
-                continue
-
-            with rasterio.open(source_path) as src:
-                transform = src.transform
-                if target_crs is None:
-                    target_crs = src.crs
-
-            for mask, score in zip(res["masks"], res["scores"]):
-                if not np.any(mask):
-                    continue
-
-                # Convert mask to uint8 for polygonization
-                mask_uint8 = mask.astype(np.uint8)
-                if mask_uint8.max() == 1:
-                    mask_uint8 *= 255
-
-                # Extract shapes using the image's specific transform
-                extracted_shapes = features.shapes(
-                    mask_uint8, mask=(mask_uint8 > 0), transform=transform
-                )
-
-                for g, v in extracted_shapes:
-                    poly = shape(g)
-                    # TODO: make it work
-                    # if simplify_tolerance > 0:
-                    #     poly = poly.simplify(simplify_tolerance, preserve_topology=True)
-
-                    if not poly.is_empty:
-                        all_geoms.append(poly)
-                        all_ids.append(source_path)
-                        all_scores.append(score)
-
-        if not all_geoms:
-            return None
-
-        return gpd.GeoDataFrame(
-            {"geometry": all_geoms, "image_id": all_ids, "score": all_scores},
-            crs=target_crs,
+        raw_results = self.processor.post_process_instance_segmentation(
+            outputs,
+            threshold=self.confidence_threshold,
+            mask_threshold=self.mask_threshold,
+            target_sizes=target_sizes,
         )
 
-    def _to_pil(self, img_input: Union[np.ndarray, Image.Image, str]) -> Image.Image:
-        """Convert any input type to PIL with explicit typing."""
-        if isinstance(img_input, str):
-            if img_input.lower().endswith((".tif", ".tiff")):
-                with rasterio.open(img_input) as src:
-                    arr: np.ndarray = src.read()[:3, :, :]
-                    min_v: float = float(arr.min())
-                    max_v: float = float(arr.max())
-                    arr_norm: np.ndarray = (
-                        (arr - min_v) / (max_v - min_v + 1e-6) * 255
-                    ).astype(np.uint8)
-                    return Image.fromarray(arr_norm.transpose(1, 2, 0))
-            return Image.open(img_input).convert("RGB")
-        if isinstance(img_input, np.ndarray):
-            return Image.fromarray(img_input)
-        return img_input
+        formatted = self._format_batch_results(raw_results, batch_imgs)
 
-    def _format_results(
-        self, batch_results: List[Dict[str, torch.Tensor]]
+        del inputs, outputs, raw_results
+        self._free_vram(full_cleanup=clear_vram)
+        return formatted
+
+    def _format_batch_results(
+        self, raw: List[Dict], original_inputs: List[Any]
     ) -> List[PredictionResult]:
-        """Clean up tensors to numpy for backend storage."""
-        formatted: List[PredictionResult] = []
-        for res in batch_results:
-            formatted.append(
+        """Converts raw torch output to PredictionResult list."""
+        results = []
+        for i, res in enumerate(raw):
+            results.append(
                 {
                     "masks": [m.cpu().numpy() for m in res["masks"]],
                     "boxes": [b.cpu().numpy() for b in res["boxes"]],
                     "scores": [float(s.cpu().item()) for s in res["scores"]],
-                    "source": None,
+                    "source": (
+                        original_inputs[i]
+                        if isinstance(original_inputs[i], str)
+                        else None
+                    ),
                 }
             )
-        return formatted
+        return results
+
+    # --- Public Prediction Methods ---
+
+    def predict_image_boxes(
+        self, image: Union[np.ndarray, Image.Image, str], boxes: List[List[int]]
+    ) -> List[np.ndarray]:
+        """
+        Predicts masks for a single image given a list of bounding boxes in pixel coords.
+
+        Args:
+            image: Image input (path, array, or PIL).
+            boxes: List of boxes, each as [x1, y1, x2, y2] in pixel coordinates.
+
+        Returns:
+            List of binary numpy masks.
+        """
+        # Format for batch prediction: [image_idx][box_idx][coords]
+        input_boxes = [boxes]
+        # convert to float
+
+        results = self.predict_batch(
+            images=[image], input_boxes=input_boxes, batch_size=1
+        )
+
+        # Extract masks from the single result
+        image_id = self._get_image_id(image)
+        return results[image_id]["masks"]
+
+    def predict_batch(
+        self,
+        images: List[Union[np.ndarray, Image.Image, str]],
+        prompts: Optional[Union[str, List[str]]] = None,
+        input_boxes: Optional[List[List[List[float]]]] = None,
+        batch_size: int = 4,
+        clear_vram: bool = False,
+    ) -> Dict[str, PredictionResult]:
+        """
+        Generic batch prediction method supporting text or boxes.
+
+        Args:
+            images: List of images (path, array, or PIL).
+            prompts: Text prompt(s).
+            input_boxes: List of bounding boxes per image [[[x1, y1, x2, y2]]].
+        """
+        all_results: Dict[str, PredictionResult] = {}
+
+        for i in tqdm(range(0, len(images), batch_size), desc="SAM3 Batch"):
+            idx = slice(i, i + batch_size)
+            batch_imgs = images[idx]
+            batch_ids = [self._get_image_id(img) for img in batch_imgs]
+
+            kwargs = {}
+            if prompts:
+                kwargs["text"] = (
+                    prompts[idx]
+                    if isinstance(prompts, list)
+                    else [prompts] * len(batch_imgs)
+                )
+
+            if input_boxes:
+                kwargs["input_boxes"] = input_boxes[idx]
+
+            batch_out = self._execute_batch(batch_imgs, kwargs, clear_vram=clear_vram)
+            for img_id, res in zip(batch_ids, batch_out):
+                all_results[img_id] = res
+
+        return all_results
+
+    # --- Geospatial Processing ---
+
+    def results_to_gdf(
+        self, results: Dict[str, PredictionResult]
+    ) -> Optional["gpd.GeoDataFrame"]:
+        """Converts prediction dictionary into a GeoDataFrame with geographic coordinates."""
+        if not HAS_GEOSPATIAL_LIBS:
+            raise ImportError("geopandas and shapely are required.")
+
+        data = {"geometry": [], "image_id": [], "score": []}
+        common_crs = None
+
+        for _, res in results.items():
+            src_path = res.get("source")
+            if not (src_path and src_path.lower().endswith((".tif", ".tiff"))):
+                continue
+
+            try:
+                transform, crs = self._get_geospatial_metadata(src_path)
+                if common_crs is None:
+                    common_crs = crs
+
+                for mask, score in zip(res["masks"], res["scores"]):
+                    geoms = self._mask_to_polygons(mask, transform)
+                    for poly in geoms:
+                        data["geometry"].append(poly)
+                        data["image_id"].append(src_path)
+                        data["score"].append(score)
+            except Exception:
+                continue
+
+        return gpd.GeoDataFrame(data, crs=common_crs) if data["geometry"] else None
+
+    def _get_geospatial_metadata(self, path: str) -> Tuple[Any, Any]:
+        """Extracts transform and CRS from a GeoTIFF."""
+        with rasterio.open(path) as src:
+            return src.transform, src.crs
+
+    def _mask_to_polygons(self, mask: np.ndarray, transform: Any) -> List[Polygon]:
+        """Converts a single binary mask into a list of polygons."""
+        if not np.any(mask):
+            return []
+
+        polygons = []
+        mask_uint8 = mask.astype(np.uint8)
+        if mask_uint8.max() == 1:
+            mask_uint8 *= 255
+
+        for geom, _ in features.shapes(
+            mask_uint8, mask=(mask_uint8 > 0), transform=transform
+        ):
+            poly = shape(geom)
+            if not poly.is_empty:
+                polygons.append(poly)
+        return polygons
+
+    # --- Utility ---
+
+    def _free_vram(self, full_cleanup: bool = False) -> None:
+        """Releases memory from device."""
+        if full_cleanup:
+            self.model.cpu()
+        gc.collect()
+        if "cuda" in self.device:
+            torch.cuda.empty_cache()
+        if full_cleanup:
+            self.model.to(self.device)
+
+    # --- Legacy Wrappers ---
 
     def generate_masks(self, prompt: str) -> None:
-        """Legacy support for single image text prediction."""
-        if self.pil_image is None:
-            raise ValueError("No image set.")
-        # Key will be the source name if available
-        results_map = self.predict_batch_text(
-            [self.source if self.source else self.pil_image], prompt
-        )
-        res = list(results_map.values())[0]
-        self.masks, self.boxes, self.scores = res["masks"], res["boxes"], res["scores"]
-
-    def generate_masks_by_boxes(self, boxes: List[List[float]]) -> None:
-        """Legacy support for single image box prediction."""
-        if self.pil_image is None:
-            raise ValueError("No image set.")
-        results_map = self.predict_batch_boxes(
-            [self.source if self.source else self.pil_image], [boxes]
-        )
-        res = list(results_map.values())[0]
+        """Sets internal state using single image text prompt."""
+        if not self.pil_image:
+            raise ValueError("Set image first.")
+        res = list(
+            self.predict_batch([self.source or self.pil_image], prompts=prompt).values()
+        )[0]
         self.masks, self.boxes, self.scores = res["masks"], res["boxes"], res["scores"]
 
 
 if __name__ == "__main__":
-    import matplotlib.pyplot as plt
+    sam = SamGeo3()
+    # Path to a normal image
+    img_path = "data/example/image.png"
 
-    print("Initializing SamGeo3...")
-    sam = SamGeo3(model_id="data/sam3")
+    # --- EXAMPLE 1: Text Prompt ---
+    print("\n--- Running Example 1: Text Prompt ---")
+    text_results = sam.predict_batch(
+        images=[img_path], prompts="the red car", batch_size=1
+    )
+    print(f"Text Prompt Example: Found {len(text_results)} image(s) in result batch.")
 
-    img_1 = "data/example/netivot1.tif"
-    img_2 = "data/example/netivot2.tif"
+    # --- EXAMPLE 2: predict_image_boxes (Pixel Coordinates) ---
+    print("\n--- Running Example 2: predict_image_boxes ---")
 
-    # Keys will be 'netivot1.tif' and 'netivot2.tif'
-    text_results = sam.predict_batch_text([img_1, img_2], prompts="building")
+    # Bounding boxes in pixel coordinates [x1, y1, x2, y2]
+    # Representing specific regions of interest in the image
+    pixel_boxes = [[100, 150, 300, 400], [450, 50, 600, 200]]
 
-    # Use the new results_to_gdf method
-    gdf = sam.results_to_gdf(text_results)
-    if gdf is not None:
-        print(f"Total features created: {len(gdf)}")
+    masks = sam.predict_image_boxes(image=img_path, boxes=pixel_boxes)
 
-    for img_id, res in text_results.items():
-        print(f"Image {img_id}: Found {len(res['masks'])} objects.")
+    print(f"predict_image_boxes Example: Generated {len(masks)} mask(s).")
