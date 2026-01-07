@@ -37,3 +37,8 @@ htmlcov/
 .pyright/
 .ipynb_checkpoints/ 
 data/sam_gui.log
+uploads/
+outputs/
+masks_cache/
+cloudflared
+cloudflared.deb
