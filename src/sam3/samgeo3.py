@@ -28,7 +28,7 @@ except ImportError:
 
 try:
     import geopandas as gpd
-    from shapely.geometry import shape, MultiPolygon
+    from shapely.geometry import shape
 
     HAS_GEOSPATIAL_LIBS = True
 except ImportError:
@@ -43,6 +43,7 @@ class PredictionResult(TypedDict):
     masks: List[np.ndarray]
     boxes: List[np.ndarray]
     scores: List[float]
+    source: Optional[str]  # Tracks the original file path or ID for metadata
 
 
 class SamGeo3:
@@ -78,9 +79,6 @@ class SamGeo3:
         self.masks: Optional[List[np.ndarray]] = None
         self.boxes: Optional[List[np.ndarray]] = None
         self.scores: Optional[List[float]] = None
-        # Track mask origins for vectorization
-        self.mask_origins: Optional[List[str]] = None
-
         self.image: Optional[np.ndarray] = None
         self.source: Optional[str] = None
         self.image_height: Optional[int] = None
@@ -163,7 +161,6 @@ class SamGeo3:
             self.masks = None
             self.boxes = None
             self.scores = None
-            self.mask_origins = None
 
         gc.collect()
 
@@ -224,7 +221,12 @@ class SamGeo3:
             )
 
             formatted = self._format_results(batch_out)
-            for img_id, res in zip(batch_ids, formatted):
+            for j, (img_id, res) in enumerate(zip(batch_ids, formatted)):
+                # Attach source path if it exists for geospatial metadata
+                original_input = batch_imgs[j]
+                res["source"] = (
+                    original_input if isinstance(original_input, str) else None
+                )
                 all_results[img_id] = res
 
             del inputs, outputs, batch_out
@@ -272,7 +274,11 @@ class SamGeo3:
             )
 
             formatted = self._format_results(batch_out)
-            for img_id, res in zip(batch_ids, formatted):
+            for j, (img_id, res) in enumerate(zip(batch_ids, formatted)):
+                original_input = batch_imgs[j]
+                res["source"] = (
+                    original_input if isinstance(original_input, str) else None
+                )
                 all_results[img_id] = res
 
             del inputs, outputs, batch_out
@@ -280,60 +286,122 @@ class SamGeo3:
 
         return all_results
 
-    def save_masks_as_shp(
-        self, output_path: str, simplify_tolerance: float = 0.0, merge_all: bool = False
-    ) -> None:
+    def predict_batch_boxes(
+        self,
+        images: List[Union[np.ndarray, Image.Image, str]],
+        boxes: List[List[List[float]]],
+        batch_size: int = 4,
+        clear_model_weights: bool = False,
+    ) -> Dict[str, PredictionResult]:
+        """Perform batch prediction using bounding box prompts. Returns results keyed by image identifier."""
+        if len(images) != len(boxes):
+            raise ValueError("Number of images must match list of box prompts.")
+
+        all_results: Dict[str, PredictionResult] = {}
+        for i in tqdm(range(0, len(images), batch_size), desc="SAM3 Box Batch"):
+            batch_slice = slice(i, i + batch_size)
+            batch_imgs = images[batch_slice]
+            batch_boxes = boxes[batch_slice]
+            batch_ids = [self._get_image_id(img) for img in batch_imgs]
+
+            pil_imgs: List[Image.Image] = [self._to_pil(img) for img in batch_imgs]
+            target_sizes: List[List[int]] = [
+                [img.height, img.width] for img in pil_imgs
+            ]
+
+            inputs = self.processor(
+                images=pil_imgs, input_boxes=batch_boxes, return_tensors="pt"
+            ).to(self.device)
+
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+
+            batch_out: List[Dict[str, torch.Tensor]] = (
+                self.processor.post_process_instance_segmentation(
+                    outputs,
+                    threshold=self.confidence_threshold,
+                    mask_threshold=self.mask_threshold,
+                    target_sizes=target_sizes,
+                )
+            )
+
+            formatted = self._format_results(batch_out)
+            for j, (img_id, res) in enumerate(zip(batch_ids, formatted)):
+                original_input = batch_imgs[j]
+                res["source"] = (
+                    original_input if isinstance(original_input, str) else None
+                )
+                all_results[img_id] = res
+
+            del inputs, outputs, batch_out
+            self._free_vram(full_cleanup=clear_model_weights)
+
+        return all_results
+
+    def results_to_gdf(
+        self,
+        results: Dict[str, PredictionResult],
+        simplify_tolerance: float = 0.0,
+    ) -> Optional["gpd.GeoDataFrame"]:
         """
-        Convert generated masks into a geospatial Shapefile.
-        Each feature includes an 'image_id' attribute tracing it back to the source.
+        Processes batch results to create a GeoDataFrame.
+        For keys representing .tif files, it uses the embedded coordinate systems.
         """
         if not HAS_GEOSPATIAL_LIBS:
             raise ImportError("geopandas and shapely are required for this method.")
-        if self.masks is None or len(self.masks) == 0:
-            raise ValueError("No masks available. Run prediction first.")
-        if self.source is None:
-            raise ValueError("No source image (TIF) set. CRS cannot be determined.")
 
-        with rasterio.open(self.source) as src:
-            transform = src.transform
-            crs = src.crs
+        all_geoms: List[shape] = []
+        all_ids: List[str] = []
+        all_scores: List[float] = []
+        target_crs = None
 
-        geoms: List[shape] = []
-        ids: List[str] = []
+        for img_id, res in results.items():
+            source_path = res.get("source")
 
-        # If mask_origins isn't set (legacy/single image), use the current source name
-        origins = (
-            self.mask_origins
-            if self.mask_origins
-            else [os.path.basename(self.source)] * len(self.masks)
+            # Skip if we don't have a file path to pull coordinates from
+            if not source_path or not os.path.exists(source_path):
+                continue
+
+            # Only support .tif/.tiff for spatial metadata currently
+            if not source_path.lower().endswith((".tif", ".tiff")):
+                continue
+
+            with rasterio.open(source_path) as src:
+                transform = src.transform
+                if target_crs is None:
+                    target_crs = src.crs
+
+            for mask, score in zip(res["masks"], res["scores"]):
+                if not np.any(mask):
+                    continue
+
+                # Convert mask to uint8 for polygonization
+                mask_uint8 = mask.astype(np.uint8)
+                if mask_uint8.max() == 1:
+                    mask_uint8 *= 255
+
+                # Extract shapes using the image's specific transform
+                extracted_shapes = features.shapes(
+                    mask_uint8, mask=(mask_uint8 > 0), transform=transform
+                )
+
+                for g, v in extracted_shapes:
+                    poly = shape(g)
+                    if simplify_tolerance > 0:
+                        poly = poly.simplify(simplify_tolerance, preserve_topology=True)
+
+                    if not poly.is_empty:
+                        all_geoms.append(poly)
+                        all_ids.append(source_path)
+                        all_scores.append(score)
+
+        if not all_geoms:
+            return None
+
+        return gpd.GeoDataFrame(
+            {"geometry": all_geoms, "image_id": all_ids, "score": all_scores},
+            crs=target_crs,
         )
-
-        for mask, origin_id in zip(self.masks, origins):
-            mask_uint8 = mask.astype(np.uint8)
-            shapes = features.shapes(
-                mask_uint8, mask=(mask_uint8 > 0), transform=transform
-            )
-
-            for g, v in shapes:
-                s = shape(g)
-                if simplify_tolerance > 0:
-                    s = s.simplify(simplify_tolerance, preserve_topology=True)
-                geoms.append(s)
-                ids.append(origin_id)
-
-        if not geoms:
-            raise ValueError("Vectorization resulted in no geometries.")
-
-        if merge_all:
-            # Merging by ID
-            gdf_raw = gpd.GeoDataFrame({"geometry": geoms, "image_id": ids}, crs=crs)
-            gdf = gdf_raw.dissolve(by="image_id").reset_index()
-        else:
-            gdf = gpd.GeoDataFrame({"geometry": geoms, "image_id": ids}, crs=crs)
-
-        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-        gdf.to_file(output_path)
-        print(f"Saved {len(gdf)} features with image attributes to {output_path}")
 
     def _to_pil(self, img_input: Union[np.ndarray, Image.Image, str]) -> Image.Image:
         """Convert any input type to PIL with explicit typing."""
@@ -363,77 +431,49 @@ class SamGeo3:
                     "masks": [m.cpu().numpy() for m in res["masks"]],
                     "boxes": [b.cpu().numpy() for b in res["boxes"]],
                     "scores": [float(s.cpu().item()) for s in res["scores"]],
+                    "source": None,
                 }
             )
         return formatted
 
     def generate_masks(self, prompt: str) -> None:
-        """Legacy support for single image text prediction. Updates state for vectorization."""
+        """Legacy support for single image text prediction."""
         if self.pil_image is None:
             raise ValueError("No image set.")
-
-        img_id = self._get_image_id(self.source) if self.source else "current_image"
-        results_map = self.predict_batch_text([self.pil_image], prompt)
-        res = results_map[list(results_map.keys())[0]]
-
-        self.masks, self.boxes, self.scores = (
-            res["masks"],
-            res["boxes"],
-            res["scores"],
+        # Key will be the source name if available
+        results_map = self.predict_batch_text(
+            [self.source if self.source else self.pil_image], prompt
         )
-        # Store origins so save_masks_as_shp knows where they came from
-        self.mask_origins = [img_id] * len(self.masks)
+        res = list(results_map.values())[0]
+        self.masks, self.boxes, self.scores = res["masks"], res["boxes"], res["scores"]
 
     def generate_masks_by_boxes(self, boxes: List[List[float]]) -> None:
         """Legacy support for single image box prediction."""
         if self.pil_image is None:
             raise ValueError("No image set.")
-
-        # For simplicity, using a modified internal version of predict_batch_boxes
-        # but maintaining the dict-based logic
-        img_id = self._get_image_id(self.source) if self.source else "current_image"
-
-        pil_imgs = [self.pil_image]
-        target_sizes = [[self.pil_image.height, self.pil_image.width]]
-        inputs = self.processor(
-            images=pil_imgs, input_boxes=[boxes], return_tensors="pt"
-        ).to(self.device)
-
-        with torch.no_grad():
-            outputs = self.model(**inputs)
-
-        batch_out = self.processor.post_process_instance_segmentation(
-            outputs,
-            threshold=self.confidence_threshold,
-            mask_threshold=self.mask_threshold,
-            target_sizes=target_sizes,
+        results_map = self.predict_batch_boxes(
+            [self.source if self.source else self.pil_image], [boxes]
         )
-
-        res = self._format_results(batch_out)[0]
+        res = list(results_map.values())[0]
         self.masks, self.boxes, self.scores = res["masks"], res["boxes"], res["scores"]
-        self.mask_origins = [img_id] * len(self.masks)
-
-        del inputs, outputs, batch_out
-        self._free_vram()
 
 
 if __name__ == "__main__":
-    # Example Usage Script
+    import matplotlib.pyplot as plt
+
     print("Initializing SamGeo3...")
     sam = SamGeo3(model_id="data/sam3")
 
     img_1 = "data/example/netivot1.tif"
     img_2 = "data/example/netivot2.tif"
 
-    # 1. Batch Prediction with Identifiers
-    results = sam.predict_batch_text([img_1, img_2], "greenhouses")
+    # Keys will be 'netivot1.tif' and 'netivot2.tif'
+    text_results = sam.predict_batch_text([img_1, img_2], prompts="building")
 
-    # Results is now a Dict: {'netivot1.tif': {...}, 'netivot2.tif': {...}}
-    for img_id, data in results.items():
-        print(f"Image {img_id}: Detected {len(data['masks'])} objects.")
+    # Use the new results_to_gdf method
+    gdf = sam.results_to_gdf(text_results, simplify_tolerance=0.1)
+    if gdf is not None:
+        print(f"Total features created: {len(gdf)}")
 
-    # 2. Saving to Shapefile with Attributes
-    # Note: save_masks_as_shp uses self.masks, so we set state for the example
-    sam.set_image(img_1)
-    sam.generate_masks("swimming pool")
-    sam.save_masks_as_shp("outputs/pools_with_ids.shp", simplify_tolerance=0.3)
+    for img_id, res in text_results.items():
+        print(f"Image {img_id}: Found {len(res['masks'])} objects.")
