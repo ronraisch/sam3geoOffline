@@ -341,7 +341,7 @@ class SamGeo3:
     def results_to_gdf(
         self,
         results: Dict[str, PredictionResult],
-        simplify_tolerance: float = 0.0,
+        # simplify_tolerance: float = 0.0, # TODO: make it work
     ) -> Optional["gpd.GeoDataFrame"]:
         """
         Processes batch results to create a GeoDataFrame.
@@ -387,8 +387,9 @@ class SamGeo3:
 
                 for g, v in extracted_shapes:
                     poly = shape(g)
-                    if simplify_tolerance > 0:
-                        poly = poly.simplify(simplify_tolerance, preserve_topology=True)
+                    # TODO: make it work
+                    # if simplify_tolerance > 0:
+                    #     poly = poly.simplify(simplify_tolerance, preserve_topology=True)
 
                     if not poly.is_empty:
                         all_geoms.append(poly)
@@ -471,7 +472,7 @@ if __name__ == "__main__":
     text_results = sam.predict_batch_text([img_1, img_2], prompts="building")
 
     # Use the new results_to_gdf method
-    gdf = sam.results_to_gdf(text_results, simplify_tolerance=0.1)
+    gdf = sam.results_to_gdf(text_results)
     if gdf is not None:
         print(f"Total features created: {len(gdf)}")
 
