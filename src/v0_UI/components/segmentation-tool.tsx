@@ -10,7 +10,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Label } from "@/components/ui/label"
 import { Loader2, ZoomIn, ZoomOut, Move, Square, Download, Trash2 } from "lucide-react"
 
-const API_BASE = "http://localhost:8000"
+const API_BASE = "https://bureau-originally-prayer-describe.trycloudflare.com"
 
 interface BoundingBox {
   id: string
@@ -117,11 +117,17 @@ export function SegmentationTool() {
         Math.max(b.y1, b.y2),
       ])
 
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 20000)
+
       const response = await fetch(`${API_BASE}/predict-boxes`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ boxes: boxesData }),
+        signal: controller.signal,
       })
+
+      clearTimeout(timeoutId)
 
       if (!response.ok) {
         const err = await response.json()

@@ -118,7 +118,7 @@ async def upload_from_path(request: ImagePathRequest):
 
 
 @app.post("/predict-boxes")
-async def predict_boxes(request: BoxRequest):
+async def predict_boxes(request: BoxRequest, background_tasks: BackgroundTasks):
     """
     Route 2: Runs SAM3 using pixel boxes.
     Returns a grayscale image representing the sum of masks (0 to 1).
@@ -132,12 +132,11 @@ async def predict_boxes(request: BoxRequest):
     try:
         masks, scores = predict_mask(request, img_path)
 
-        mask_save_path = save_masks(masks)
         output_img_name = save_and_create_UI_mask(masks, scores)
+        background_tasks.add_task(save_masks, masks)
 
         return {
             "sum_image_url": f"{OUTPUT_DIR}/{output_img_name}",
-            "masks_npy_path": mask_save_path,
             "mask_count": len(masks),
         }
     except Exception as e:
