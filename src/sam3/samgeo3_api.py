@@ -1,3 +1,4 @@
+import logging
 import os
 import zipfile
 import shutil
@@ -96,9 +97,8 @@ async def predict_boxes(request: BoxRequest):
         )
 
     try:
-        results = sam.predict_batch(
-            images=[img_path], input_boxes=[request.boxes], batch_size=1
-        )
+        print(f"prediction with boxes: {request.boxes}")
+        results = sam.predict_batch(images=[img_path], input_boxes=[request.boxes])
 
         img_id = list(results.keys())[0]
         masks = results[img_id]["masks"]
@@ -113,7 +113,9 @@ async def predict_boxes(request: BoxRequest):
 
         if not masks:
             raise HTTPException(status_code=404, detail="No masks generated.")
-        combined_sum = np.sum(masks, axis=0).astype(np.float32)
+        combined_sum = np.mean(masks * np.array(scores).reshape(-1, 1, 1), axis=0)
+
+        # combined_sum = np.sum(masks, axis=0).astype(np.float32)
         max_val = combined_sum.max()
         grayscale_img = combined_sum / max_val if max_val > 0 else combined_sum
 
