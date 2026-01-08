@@ -10,7 +10,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Label } from "@/components/ui/label"
 import { Loader2, ZoomIn, ZoomOut, Move, Square, Download, Trash2 } from "lucide-react"
 
-const API_BASE = "https://planner-turbo-len-advances.trycloudflare.com"
+const API_BASE = "http://localhost:8000"
 
 interface BoundingBox {
   id: string

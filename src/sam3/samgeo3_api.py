@@ -3,7 +3,7 @@ import os
 import zipfile
 import shutil
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Tuple, TypedDict
 
 import numpy as np
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -11,6 +11,24 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from PIL import Image
 from fastapi.middleware.cors import CORSMiddleware
+
+import os
+import uuid
+import zipfile
+import shutil
+import numpy as np
+import geopandas as gpd
+from typing import List, Optional, Tuple, Any
+from fastapi import HTTPException
+from fastapi.responses import JSONResponse, FileResponse
+from shapely.geometry import shape
+from rasterio import features, transform
+from samgeo3 import PredictionResult
+
+
+import geopandas as gpd
+from shapely.geometry import shape
+from rasterio import features, transform
 
 # Importing the SamGeo3 class
 from samgeo3 import SamGeo3
@@ -37,10 +55,17 @@ for folder in FOLDERS_TO_CLEAN:
 # Initialize SAM3
 sam = SamGeo3(confidence_threshold=0.1, mask_threshold=0.1)
 
+
 # Global state to keep track of the "current" image for the session
-current_image_state = {
+class ImageState(TypedDict, total=False):
+    path: Optional[str]
+    masks: Optional[List[np.ndarray]]
+    scores: Optional[np.ndarray]
+
+
+current_image_state: ImageState = {
     "path": None,
-    "masks": None,  # List of numpy arrays
+    "masks": None,
     "scores": None,
 }
 
@@ -51,6 +76,22 @@ class BoxRequest(BaseModel):
 
 class ImagePathRequest(BaseModel):
     path: str
+
+
+async def download_and_save_web_file(input_path: str, dest_path: str):
+
+    from samgeo.common import download_file
+
+    temp_file = download_file(input_path)
+    if temp_file is None:
+        raise HTTPException(status_code=400, detail="Failed to download file from URL.")
+    shutil.move(temp_file, dest_path)
+
+
+async def move_local_file(input_path: str, dest_path: str):
+    if not os.path.exists(input_path):
+        raise HTTPException(status_code=404, detail="Input path does not exist.")
+    shutil.copy(input_path, dest_path)
 
 
 @app.post("/upload-path")
@@ -65,17 +106,9 @@ async def upload_from_path(request: ImagePathRequest):
 
     try:
         if input_path.startswith(("http://", "https://")):
-            from samgeo.common import download_file
-
-            temp_file = download_file(input_path)
-            shutil.move(temp_file, dest_path)
+            await download_and_save_web_file(input_path, dest_path)
         else:
-            if not os.path.exists(input_path):
-                raise HTTPException(
-                    status_code=404, detail="Input path does not exist."
-                )
-            shutil.copy(input_path, dest_path)
-
+            await move_local_file(input_path, dest_path)
         current_image_state["path"] = dest_path
         sam.set_image(dest_path)
 
@@ -90,41 +123,17 @@ async def predict_boxes(request: BoxRequest):
     Route 2: Runs SAM3 using pixel boxes.
     Returns a grayscale image representing the sum of masks (0 to 1).
     """
-    img_path = current_image_state["path"]
+    img_path = current_image_state.get("path")
     if not img_path:
         raise HTTPException(
             status_code=400, detail="No image loaded. Call /upload-path first."
         )
 
     try:
-        print(f"prediction with boxes: {request.boxes}")
-        results = sam.predict_batch(images=[img_path], input_boxes=[request.boxes])
+        masks, scores = predict_mask(request, img_path)
 
-        img_id = list(results.keys())[0]
-        masks = results[img_id]["masks"]
-        scores = results[img_id]["scores"]
-
-        current_image_state["masks"] = masks
-        current_image_state["scores"] = scores
-
-        mask_file_name = f"masks_{uuid.uuid4()}.npy"
-        mask_save_path = os.path.join(MASKS_DIR, mask_file_name)
-        np.save(mask_save_path, np.array(masks))
-
-        if not masks:
-            raise HTTPException(status_code=404, detail="No masks generated.")
-        combined_sum = np.mean(masks * np.array(scores).reshape(-1, 1, 1), axis=0)
-
-        # combined_sum = np.sum(masks, axis=0).astype(np.float32)
-        max_val = combined_sum.max()
-        grayscale_img = combined_sum / max_val if max_val > 0 else combined_sum
-
-        output_img_name = f"sum_{uuid.uuid4()}.png"
-        output_img_path = os.path.join(OUTPUT_DIR, output_img_name)
-
-        # Using Pillow to save the sum image
-        pil_img = Image.fromarray((grayscale_img * 255).astype(np.uint8), mode="L")
-        pil_img.save(output_img_path)
+        mask_save_path = save_masks(masks)
+        output_img_name = save_and_create_UI_mask(masks, scores)
 
         return {
             "sum_image_url": f"{OUTPUT_DIR}/{output_img_name}",
@@ -135,25 +144,128 @@ async def predict_boxes(request: BoxRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def save_and_create_UI_mask(masks: List[np.ndarray], scores: np.ndarray) -> str:
+    grayscale_img = create_UI_mask(masks, scores)
+
+    output_img_name = save_UI_mask(grayscale_img)
+    return output_img_name
+
+
+def save_UI_mask(grayscale_img: np.ndarray) -> str:
+    output_img_name = f"sum_{uuid.uuid4()}.png"
+    output_img_path = os.path.join(OUTPUT_DIR, output_img_name)
+
+    # Using Pillow to save the sum image
+    pil_img = Image.fromarray((grayscale_img * 255).astype(np.uint8), mode="L")
+    pil_img.save(output_img_path)
+    return output_img_name
+
+
+def create_UI_mask(masks: List[np.ndarray], scores: np.ndarray) -> np.ndarray:
+    combined_sum = np.mean(masks * scores.reshape(-1, 1, 1), axis=0)
+    max_val = combined_sum.max()
+    grayscale_img = combined_sum / max_val if max_val > 0 else combined_sum
+    return grayscale_img
+
+
+def save_masks(masks: List[np.ndarray]) -> str:
+    mask_file_name = f"masks_{uuid.uuid4()}.npy"
+    mask_save_path = os.path.join(MASKS_DIR, mask_file_name)
+    np.save(mask_save_path, np.array(masks))
+
+    if not masks:
+        raise HTTPException(status_code=404, detail="No masks generated.")
+    return mask_save_path
+
+
+def predict_mask(
+    request: BoxRequest, img_path: str
+) -> Tuple[List[np.ndarray], np.ndarray]:
+    results = sam.predict_batch(images=[img_path], input_boxes=[request.boxes])
+
+    img_id = list(results.keys())[0]
+    masks = results[img_id]["masks"]
+    scores = np.array(results[img_id]["scores"])
+
+    current_image_state["masks"] = masks
+    current_image_state["scores"] = scores
+    return masks, scores
+
+
+def create_pixel_gdf(
+    filtered_masks: List[np.ndarray], filtered_scores: List[float]
+) -> gpd.GeoDataFrame:
+
+    # Identity transform keeps coordinates as raw pixels
+    ident_transform = transform.IDENTITY
+    geoms = []
+    final_scores = []
+
+    for mask, score in zip(filtered_masks, filtered_scores):
+        mask_uint8 = (mask > 0).astype(np.uint8)
+        # Generate shapes from mask
+        for g, v in features.shapes(
+            mask_uint8, mask=mask_uint8, transform=ident_transform
+        ):
+            geoms.append(shape(g))
+            final_scores.append(score)  # Assign score to every polygon part
+
+    gdf = gpd.GeoDataFrame({"geometry": geoms, "score": final_scores}, crs=None)
+    if gdf.empty:
+        raise HTTPException(status_code=404, detail="No geometry found in masks.")
+    return gdf
+
+
+def create_geo_gdf(
+    filtered_masks: List[np.ndarray],
+    filtered_scores: List[float],
+    img_path: Optional[str],
+) -> gpd.GeoDataFrame:
+    if img_path is None:
+        raise HTTPException(
+            status_code=400, detail="Image path is required for geospatial processing."
+        )
+    mock_results = {
+        "session": PredictionResult(
+            masks=filtered_masks,
+            scores=filtered_scores,
+            source=img_path,
+            boxes=[np.array([0])],  # mock, actually used not used
+        )
+    }
+    gdf = sam.results_to_gdf(mock_results)
+
+    if gdf is None:
+        raise HTTPException(status_code=404, detail="No geometry found in masks.")
+    return gdf
+
+
 @app.get("/export-geodata")
 async def export_geodata(threshold: float = 0.5):
     """
     Route 3: Generates vector data from cached masks.
     Supports both GeoTIFF (geographic coords) and standard images (pixel coords).
     """
-    if current_image_state["masks"] is None:
+    if current_image_state.get("masks") is None:
         raise HTTPException(
             status_code=400, detail="No masks found. Run /predict-boxes first."
         )
 
-    img_path = current_image_state["path"]
-    is_geospatial = img_path.lower().endswith((".tif", ".tiff"))
+    img_path = current_image_state.get("path")
+    is_geospatial = img_path and img_path.lower().endswith((".tif", ".tiff"))
 
     try:
         # Build results for conversion
-        filtered_masks = []
-        filtered_scores = []
-        for m, s in zip(current_image_state["masks"], current_image_state["scores"]):
+        filtered_masks: List[np.ndarray] = []
+        filtered_scores: List[float] = []
+        masks = current_image_state.get("masks")
+        scores = current_image_state.get("scores")
+        if masks is None or scores is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No masks or scores found. Run /predict-boxes first.",
+            )
+        for m, s in zip(masks, scores):
             if s >= threshold:
                 filtered_masks.append(m)
                 filtered_scores.append(s)
@@ -165,62 +277,55 @@ async def export_geodata(threshold: float = 0.5):
 
         # If it's a normal image, we manually create a GDF in pixel space
         if not is_geospatial:
-            import geopandas as gpd
-            from shapely.geometry import shape
-            from rasterio import features, transform
-
-            # Identity transform keeps coordinates as raw pixels
-            ident_transform = transform.IDENTITY
-            geoms = []
-            final_scores = []
-
-            for mask, score in zip(filtered_masks, filtered_scores):
-                mask_uint8 = (mask > 0).astype(np.uint8)
-                # Generate shapes from mask
-                for g, v in features.shapes(
-                    mask_uint8, mask=mask_uint8, transform=ident_transform
-                ):
-                    geoms.append(shape(g))
-                    final_scores.append(score)  # Assign score to every polygon part
-
-            gdf = gpd.GeoDataFrame({"geometry": geoms, "score": final_scores}, crs=None)
+            gdf = create_pixel_gdf(filtered_masks, filtered_scores)
         else:
+
             # Use the built-in geospatial logic for GeoTIFFs
-            mock_results = {
-                "session": {
-                    "masks": filtered_masks,
-                    "scores": filtered_scores,
-                    "source": img_path,
-                }
-            }
-            gdf = sam.results_to_gdf(mock_results)
+            gdf = create_geo_gdf(filtered_masks, filtered_scores, img_path)
 
         if gdf is None or gdf.empty:
             return JSONResponse(
                 {"message": "Failed to vectorize masks."}, status_code=404
             )
 
-        temp_export_id = str(uuid.uuid4())
-        shape_dir = os.path.join(OUTPUT_DIR, temp_export_id)
-        os.makedirs(shape_dir, exist_ok=True)
+        zip_path = save_gdf_as_zip(gdf)
 
-        base_name = "export_results"
-        shp_path = os.path.join(shape_dir, f"{base_name}.shp")
-        gdf.to_file(shp_path)
-
-        zip_path = os.path.join(OUTPUT_DIR, f"{temp_export_id}.zip")
-        with zipfile.ZipFile(zip_path, "w") as zipf:
-            for root, _, files in os.walk(shape_dir):
-                for file in files:
-                    zipf.write(os.path.join(root, file), file)
-
-        shutil.rmtree(shape_dir)
         return FileResponse(
             zip_path, media_type="application/zip", filename=f"export_{threshold}.zip"
         )
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def save_gdf_as_zip(gdf: gpd.GeoDataFrame) -> str:
+    temp_export_id, shape_dir = create_shp_files_dir()
+    save_shp_files(gdf, shape_dir)
+    zip_path = save_folder_as_zip(temp_export_id, shape_dir)
+    shutil.rmtree(shape_dir)
+    return zip_path
+
+
+def save_folder_as_zip(zip_file_name: str, folder: str) -> str:
+    zip_path = os.path.join(OUTPUT_DIR, f"{zip_file_name}.zip")
+    with zipfile.ZipFile(zip_path, "w") as zipf:
+        for root, _, files in os.walk(folder):
+            for file in files:
+                zipf.write(os.path.join(root, file), file)
+    return zip_path
+
+
+def save_shp_files(gdf: gpd.GeoDataFrame, shape_dir: str):
+    base_name = "export_results"
+    shp_path = os.path.join(shape_dir, f"{base_name}.shp")
+    gdf.to_file(shp_path)
+
+
+def create_shp_files_dir() -> Tuple[str, str]:
+    temp_export_id = str(uuid.uuid4())
+    shape_dir = os.path.join(OUTPUT_DIR, temp_export_id)
+    os.makedirs(shape_dir, exist_ok=True)
+    return temp_export_id, shape_dir
 
 
 @app.delete("/cleanup")

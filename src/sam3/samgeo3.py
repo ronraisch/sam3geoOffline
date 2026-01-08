@@ -262,7 +262,7 @@ class SamGeo3:
 
     def results_to_gdf(
         self, results: Dict[str, PredictionResult]
-    ) -> Optional["gpd.GeoDataFrame"]:
+    ) -> Optional[gpd.GeoDataFrame]:
         """Converts prediction dictionary into a GeoDataFrame with geographic coordinates."""
         if not HAS_GEOSPATIAL_LIBS:
             raise ImportError("geopandas and shapely are required.")
@@ -288,7 +288,7 @@ class SamGeo3:
                         data["score"].append(score)
             except Exception:
                 continue
-
+        # TODO: return empty geodataframe
         return gpd.GeoDataFrame(data, crs=common_crs) if data["geometry"] else None
 
     def _get_geospatial_metadata(self, path: str) -> Tuple[Any, Any]:
