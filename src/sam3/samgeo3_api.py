@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple, TypedDict
 import numpy as np
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from PIL import Image
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -70,12 +70,22 @@ current_image_state: ImageState = {
 }
 
 
-class BoxRequest(BaseModel):
-    boxes: List[List[float]]  # [[x1, y1, x2, y2], ...]
-
+class MaskRequest(BaseModel):
+    boxes: Optional[List[List[float]]] = Field(None, description="List of bounding boxes, each as [x1, y1, x2, y2] in pixel coordinates")
+    text: Optional[str] = Field(None, description="Text prompt for segmentation")
+    
+    @property
+    def input_boxes(self) -> Optional[List[List[List[float]]]]:
+        if self.boxes is None:
+            return None
+        return [self.boxes]
+    
+    def __post_init__(self):
+        if self.text is None and self.boxes is None:
+            raise HTTPException(status_code=400, detail="Either text or boxes must be provided")
 
 class ImagePathRequest(BaseModel):
-    path: str
+    path: str = Field(..., description="Path to the image file")
 
 
 async def download_and_save_web_file(input_path: str, dest_path: str):
@@ -117,8 +127,8 @@ async def upload_from_path(request: ImagePathRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/predict-boxes")
-async def predict_boxes(request: BoxRequest, background_tasks: BackgroundTasks):
+@app.post("/predict-mask")
+async def predict_boxes(request: MaskRequest, background_tasks: BackgroundTasks):
     """
     Route 2: Runs SAM3 using pixel boxes.
     Returns a grayscale image representing the sum of masks (0 to 1).
@@ -161,7 +171,7 @@ def save_UI_mask(grayscale_img: np.ndarray) -> str:
 
 
 def create_UI_mask(masks: List[np.ndarray], scores: np.ndarray) -> np.ndarray:
-    combined_sum = np.mean(masks * scores.reshape(-1, 1, 1), axis=0)
+    combined_sum = np.max(masks * scores.reshape(-1, 1, 1), axis=0)
     max_val = combined_sum.max()
     grayscale_img = combined_sum / max_val if max_val > 0 else combined_sum
     return grayscale_img
@@ -178,9 +188,9 @@ def save_masks(masks: List[np.ndarray]) -> str:
 
 
 def predict_mask(
-    request: BoxRequest, img_path: str
+    request: MaskRequest, img_path: str
 ) -> Tuple[List[np.ndarray], np.ndarray]:
-    results = sam.predict_batch(images=[img_path], input_boxes=[request.boxes])
+    results = sam.predict_batch(images=[img_path], input_boxes=request.input_boxes, prompts=request.text)
 
     img_id = list(results.keys())[0]
     masks = results[img_id]["masks"]

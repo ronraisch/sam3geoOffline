@@ -15,17 +15,16 @@ from rasterio import features
 from rasterio.io import DatasetReader
 from shapely.geometry import shape, Polygon
 import torch
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+from src.sam3.sam3dataset import SAM3Dataset, collate_fn
 
-try:
-    from transformers import (
-        Sam3Model,  # pyright: ignore[reportAttributeAccessIssue, reportMissingImports]
-        Sam3Processor,  # pyright: ignore[reportAttributeAccessIssue, reportMissingImports]
-    )
+from transformers import (
+    Sam3Model,
+    Sam3Processor,
+)
 
-    SAM3_TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    SAM3_TRANSFORMERS_AVAILABLE = False
+
 
 try:
     import geopandas as gpd
@@ -56,14 +55,15 @@ class SamGeo3:
         confidence_threshold: float = 0.25,
         mask_threshold: float = 0.25,
     ) -> None:
-        if not SAM3_TRANSFORMERS_AVAILABLE:
-            raise ImportError("SAM3 Transformers backend not found.")
 
-        self.device = device or str(common.get_device())
+
+        device_str = device or str(common.get_device())
+        self.device = torch.device(device_str)
         self.confidence_threshold = confidence_threshold
         self.mask_threshold = mask_threshold
 
-        self.model: Sam3Model = Sam3Model.from_pretrained(model_id).to(self.device)
+        model = Sam3Model.from_pretrained(model_id)
+        self.model: Sam3Model = model.to(self.device)  # type: ignore[call-arg]
         self.processor: Sam3Processor = Sam3Processor.from_pretrained(model_id)
 
         # Session State
@@ -194,7 +194,7 @@ class SamGeo3:
     # --- Public Prediction Methods ---
 
     def predict_image_boxes(
-        self, image: Union[np.ndarray, Image.Image, str], boxes: List[List[int]]
+        self, image: Union[np.ndarray, Image.Image, str], boxes: List[List[float]]
     ) -> List[np.ndarray]:
         """
         Predicts masks for a single image given a list of bounding boxes in pixel coords.
@@ -224,6 +224,8 @@ class SamGeo3:
         prompts: Optional[Union[str, List[str]]] = None,
         input_boxes: Optional[List[List[List[float]]]] = None,
         batch_size: int = 4,
+        num_workers: int = 4,
+        verbose: bool = True,
         clear_vram: bool = False,
     ) -> Dict[str, PredictionResult]:
         """
@@ -235,29 +237,40 @@ class SamGeo3:
             input_boxes: List of bounding boxes per image [[[x1, y1, x2, y2]]].
         """
         all_results: Dict[str, PredictionResult] = {}
+        
+        dataset = SAM3Dataset(
+            images=images, 
+            prompts=prompts, 
+            input_boxes=input_boxes, 
+            id_func=self._get_image_id
+        )
+        
+        dataloader = DataLoader(
+            dataset, 
+            batch_size=batch_size, 
+            shuffle=False, 
+            num_workers=num_workers,
+            collate_fn=collate_fn
+        )
 
-        for i in tqdm(range(0, len(images), batch_size), desc="SAM3 Batch"):
-            idx = slice(i, i + batch_size)
-            batch_imgs = images[idx]
-            batch_ids = [self._get_image_id(img) for img in batch_imgs]
+        for batch in tqdm(dataloader, desc="SAM3 Batch", disable=not verbose):
+            batch_imgs = batch["image"]
+            batch_ids = batch["id"]
 
             kwargs = {}
-            if prompts:
-                kwargs["text"] = (
-                    prompts[idx]
-                    if isinstance(prompts, list)
-                    else [prompts] * len(batch_imgs)
-                )
+            if "prompt" in batch:
+                kwargs["text"] = batch["prompt"]
 
-            if input_boxes:
-                kwargs["input_boxes"] = input_boxes[idx]
+            if "boxes" in batch:
+                kwargs["input_boxes"] = batch["boxes"]
 
+            # Execute prediction
             batch_out = self._execute_batch(batch_imgs, kwargs, clear_vram=clear_vram)
+            
             for img_id, res in zip(batch_ids, batch_out):
                 all_results[img_id] = res
 
         return all_results
-
     # --- Geospatial Processing ---
 
     def results_to_gdf(
@@ -321,10 +334,10 @@ class SamGeo3:
         if full_cleanup:
             self.model.cpu()
         gc.collect()
-        if "cuda" in self.device:
+        if "cuda" in str(self.device):
             torch.cuda.empty_cache()
         if full_cleanup:
-            self.model.to(self.device)
+            self.model.to(self.device)  # type: ignore[call-arg]
 
     # --- Legacy Wrappers ---
 
@@ -355,7 +368,7 @@ if __name__ == "__main__":
 
     # Bounding boxes in pixel coordinates [x1, y1, x2, y2]
     # Representing specific regions of interest in the image
-    pixel_boxes = [[100, 150, 300, 400], [450, 50, 600, 200]]
+    pixel_boxes = [[100.0, 150.0, 300.0, 400.0], [450.0, 50.0, 600.0, 200.0]]
 
     masks = sam.predict_image_boxes(image=img_path, boxes=pixel_boxes)
 

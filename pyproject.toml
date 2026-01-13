@@ -1,0 +1,13 @@
+[project]
+name = "sam3geooffline"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.128.0",
+    "jupyter>=1.1.1",
+    "opencv-python>=4.12.0.88",
+    "segment-geospatial[samgeo3]>=1.2.1",
+    "tokenizers>=0.13.0,<1.0",
+]
