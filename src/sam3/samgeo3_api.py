@@ -53,7 +53,7 @@ for folder in FOLDERS_TO_CLEAN:
     os.makedirs(folder, exist_ok=True)
 
 # Initialize SAM3
-sam = SamGeo3(confidence_threshold=0.1, mask_threshold=0.1)
+sam = SamGeo3(mask)
 
 
 # Global state to keep track of the "current" image for the session
